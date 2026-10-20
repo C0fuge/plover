@@ -1,0 +1,90 @@
+name: build hadoopfs extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      duckdb_version:
+        description: DuckDB release tag
+        default: v1.4.5
+      arch:
+        description: target platform(s)
+        type: choice
+        options: [amd64, arm64, both]
+        default: amd64
+      deps_only:
+        description: only build (and cache) protobuf/gsasl/libhdfs3
+        type: boolean
+        default: false
+
+# a new run for the same DuckDB version cancels the running one (CI minutes are shared)
+concurrency:
+  group: build-${{ inputs.duckdb_version }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.arch == 'both' && '["amd64","arm64"]' || format('["{0}"]', inputs.arch)) }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}
+    timeout-minutes: 150
+    env:
+      DUCKDB_VERSION: ${{ inputs.duckdb_version }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1500M
+      CCACHE_COMPRESS: "1"
+      OUT_DIR: ${{ github.workspace }}/out
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: packages
+        run: |
+          dnf install -y -q ninja-build libxml2-devel krb5-devel libuuid-devel openssl-devel boost-devel git >/dev/null
+          dnf install -y -q epel-release >/dev/null && dnf install -y -q ccache >/dev/null || echo "no ccache"
+          gcc --version | head -1; cmake --version | head -1; nproc
+
+      - name: deps cache
+        id: deps
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/deps
+          key: deps-${{ matrix.arch }}-${{ hashFiles('sources.env', 'scripts/common.sh', 'scripts/build-deps.sh', 'patches/libhdfs3/**') }}
+
+      - name: build deps
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: bash scripts/build-deps.sh
+
+      - name: save deps
+        if: steps.deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/deps
+          key: ${{ steps.deps.outputs.cache-primary-key }}
+
+      - name: ccache restore
+        if: ${{ !inputs.deps_only }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.arch }}-${{ inputs.duckdb_version }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.arch }}-${{ inputs.duckdb_version }}-
+
+      - name: build extension
+        if: ${{ !inputs.deps_only }}
+        run: bash scripts/build-ext.sh
+
+      - name: ccache save
+        if: ${{ always() && !inputs.deps_only }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.arch }}-${{ inputs.duckdb_version }}-${{ github.run_id }}
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !inputs.deps_only }}
+        with:
+          name: hadoopfs-${{ inputs.duckdb_version }}-linux_${{ matrix.arch }}
+          path: out/
+          retention-days: 30

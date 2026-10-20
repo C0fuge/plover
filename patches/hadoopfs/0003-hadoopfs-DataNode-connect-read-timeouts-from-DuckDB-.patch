@@ -1,0 +1,158 @@
+From e1e8d0030878a1cc9c811459aadf7f351be94af1 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:49:30 +0300
+Subject: [PATCH 3/3] hadoopfs: DataNode connect/read timeouts from DuckDB
+ settings, safe defaults
+
+New settings (BIGINT, ms; also env HDFS_CONNECT_TIMEOUT_MS / HDFS_READ_TIMEOUT_MS):
+  hdfs_connect_timeout_ms -> libhdfs3 input.connect.timeout + output.connect.timeout
+  hdfs_read_timeout_ms    -> libhdfs3 input.read.timeout
+Precedence: DuckDB setting (> 0) > value in LIBHDFS3_CONF > default 5000 / 15000.
+libhdfs3's own defaults (600 s / 3600 s) turn a silently lost DataNode into a
+query hang of 15 min .. 1 h (bench H1); with a read timeout libhdfs3 marks the
+node failed for the stream and reads the next replica.
+The values are read when the extension first connects to a namenode (the
+connection is cached per namenode, like the other hdfs_* settings).
+---
+ src/hadoopfs.cpp         | 35 +++++++++++++++++++++++++++++++++++
+ src/include/hadoopfs.hpp | 25 +++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/src/hadoopfs.cpp b/src/hadoopfs.cpp
+index 5722807..ea2e351 100644
+--- a/src/hadoopfs.cpp
++++ b/src/hadoopfs.cpp
+@@ -159,8 +159,32 @@ namespace duckdb
+         return false;
+     }
+ 
++    // DuckDB setting (> 0) wins; otherwise a value from LIBHDFS3_CONF is kept; otherwise the safe default.
++    inline static void setHdfsTimeout(hdfsBuilder * hdfsBuilder, const char * key, int64_t setting_ms, int64_t default_ms)
++    {
++        int64_t timeout_ms = setting_ms;
++        if (timeout_ms <= 0)
++        {
++            char * conf_value = nullptr;
++            if (hdfsConfGetStr(key, &conf_value) == 0)
++            {
++                hdfsConfStrFree(conf_value);
++                return;
++            }
++            timeout_ms = default_ms;
++        }
++        timeout_ms = MinValue<int64_t>(timeout_ms, NumericLimits<int32_t>::Maximum());
++        hdfsBuilderConfSetStr(hdfsBuilder, key, to_string(timeout_ms).c_str());
++    }
++
+     inline static void setHdfsBuilderParams(hdfsBuilder * hdfsBuilder, const HDFSParams & params) {
+ 
++        // DataNode socket timeouts. A read timeout makes libhdfs3 mark the DataNode as failed for this stream and
++        // read the block from the next replica.
++        setHdfsTimeout(hdfsBuilder, "input.connect.timeout", params.connect_timeout_ms, HDFSParams::DEFAULT_CONNECT_TIMEOUT_MS);
++        setHdfsTimeout(hdfsBuilder, "output.connect.timeout", params.connect_timeout_ms, HDFSParams::DEFAULT_CONNECT_TIMEOUT_MS);
++        setHdfsTimeout(hdfsBuilder, "input.read.timeout", params.read_timeout_ms, HDFSParams::DEFAULT_READ_TIMEOUT_MS);
++
+         hdfsBuilderSetNameNode(hdfsBuilder, "default");
+         if (params.namenode != "default")
+         {
+@@ -421,6 +445,15 @@ namespace duckdb
+         config.AddExtensionOption(HDFSParams::HDFS_HA_NAMENODES, "HDFS HA namenodes", LogicalType::VARCHAR, "");
+         config.AddExtensionOption(HDFSParams::HDFS_SHORTCIRCUIT, "HDFS short-circuit", LogicalType::BOOLEAN, false);
+         config.AddExtensionOption(HDFSParams::HDFS_DOMAIN_SOCKET_PATH, "HDFS domain socket path", LogicalType::VARCHAR, "");
++        // NULL = not set: LIBHDFS3_CONF (input.connect.timeout / input.read.timeout) applies, else 5000 / 15000 ms.
++        // Read when the extension first connects to a namenode.
++        config.AddExtensionOption(HDFSParams::HDFS_CONNECT_TIMEOUT_MS,
++                                  "HDFS DataNode connect timeout in ms (NULL: LIBHDFS3_CONF value, else 5000)",
++                                  LogicalType::BIGINT, Value());
++        config.AddExtensionOption(HDFSParams::HDFS_READ_TIMEOUT_MS,
++                                  "HDFS DataNode read timeout in ms; on timeout the next replica is read "
++                                  "(NULL: LIBHDFS3_CONF value, else 15000)",
++                                  LogicalType::BIGINT, Value());
+ 
+         auto provider = duckdb::make_uniq<HDFSEnvironmentSettingsProvider>(config);
+         provider->SetAll();
+@@ -529,6 +562,8 @@ namespace duckdb
+             }
+             url_hdfs_params.shortcircuit = settings.shortcircuit;
+             url_hdfs_params.domain_socket_path = settings.domain_socket_path;
++            url_hdfs_params.connect_timeout_ms = settings.connect_timeout_ms;
++            url_hdfs_params.read_timeout_ms = settings.read_timeout_ms;
+             auto hdfs_builder = hdfsNewBuilder();
+             setHdfsBuilderParams(hdfs_builder, url_hdfs_params);
+             return hdfsBuilderConnect(hdfs_builder);
+diff --git a/src/include/hadoopfs.hpp b/src/include/hadoopfs.hpp
+index 1219222..2257f23 100644
+--- a/src/include/hadoopfs.hpp
++++ b/src/include/hadoopfs.hpp
+@@ -17,12 +17,21 @@ namespace duckdb
+         static constexpr const char *HDFS_HA_NAMENODES = "hdfs_ha_namenodes";
+         static constexpr const char *HDFS_SHORTCIRCUIT = "hdfs_shortcircuit";
+         static constexpr const char *HDFS_DOMAIN_SOCKET_PATH = "hdfs_domain_socket_path";
++        static constexpr const char *HDFS_CONNECT_TIMEOUT_MS = "hdfs_connect_timeout_ms";
++        static constexpr const char *HDFS_READ_TIMEOUT_MS = "hdfs_read_timeout_ms";
++        //! used when neither the DuckDB setting nor LIBHDFS3_CONF sets a value (libhdfs3's own defaults are 600 s / 3600 s,
++        //! which turn a silently lost DataNode into a hang instead of a failover to the next replica)
++        static constexpr int64_t DEFAULT_CONNECT_TIMEOUT_MS = 5000;
++        static constexpr int64_t DEFAULT_READ_TIMEOUT_MS = 15000;
+ 
+         string namenode = "default";
+         string url = "";
+         vector<string> ha_namenodes;
+         bool shortcircuit;
+         string domain_socket_path;
++        //! <= 0: not set in DuckDB (LIBHDFS3_CONF value, else the default above)
++        int64_t connect_timeout_ms = 0;
++        int64_t read_timeout_ms = 0;
+ 
+         template <typename T>
+         static HDFSParams ReadFrom(T &config)
+@@ -31,6 +40,8 @@ namespace duckdb
+             vector<string> ha_namenodes;
+             bool shortcircuit = false;
+             string domain_socket_path = "";
++            int64_t connect_timeout_ms = 0;
++            int64_t read_timeout_ms = 0;
+             Value value;
+ 
+             if (config.TryGetCurrentSetting(HDFSParams::HDFS_DEFAULT_NAMENODE, value))
+@@ -66,12 +77,22 @@ namespace duckdb
+             {
+                 domain_socket_path = value.ToString();
+             }
++            if (config.TryGetCurrentSetting(HDFSParams::HDFS_CONNECT_TIMEOUT_MS, value) && !value.IsNull())
++            {
++                connect_timeout_ms = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
++            }
++            if (config.TryGetCurrentSetting(HDFSParams::HDFS_READ_TIMEOUT_MS, value) && !value.IsNull())
++            {
++                read_timeout_ms = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
++            }
+             HDFSParams result;
+             result.namenode = namenode;
+             result.url = "";
+             result.ha_namenodes = ha_namenodes;
+             result.shortcircuit = shortcircuit;
+             result.domain_socket_path = domain_socket_path;
++            result.connect_timeout_ms = connect_timeout_ms;
++            result.read_timeout_ms = read_timeout_ms;
+             return result;
+         }
+         // static HDFSParams ReadFrom(DatabaseInstance &instance);
+@@ -84,6 +105,8 @@ namespace duckdb
+         static constexpr const char *HDFS_HA_NAMENODES = "HDFS_HA_NAMENODES";
+         static constexpr const char *HDFS_SHORTCIRCUIT = "HDFS_SHORTCIRCUIT";
+         static constexpr const char *HDFS_DOMAIN_SOCKET_PATH = "HDFS_DOMAIN_SOCKET_PATH";
++        static constexpr const char *HDFS_CONNECT_TIMEOUT_MS = "HDFS_CONNECT_TIMEOUT_MS";
++        static constexpr const char *HDFS_READ_TIMEOUT_MS = "HDFS_READ_TIMEOUT_MS";
+ 
+         explicit HDFSEnvironmentSettingsProvider(DBConfig &config) : config(config){};
+ 
+@@ -115,6 +138,8 @@ namespace duckdb
+             this->SetExtensionOptionValue(HDFSParams::HDFS_HA_NAMENODES, this->HDFS_HA_NAMENODES);
+             this->SetExtensionOptionValue(HDFSParams::HDFS_SHORTCIRCUIT, this->HDFS_SHORTCIRCUIT);
+             this->SetExtensionOptionValue(HDFSParams::HDFS_DOMAIN_SOCKET_PATH, this->HDFS_DOMAIN_SOCKET_PATH);
++            this->SetExtensionOptionValue(HDFSParams::HDFS_CONNECT_TIMEOUT_MS, this->HDFS_CONNECT_TIMEOUT_MS);
++            this->SetExtensionOptionValue(HDFSParams::HDFS_READ_TIMEOUT_MS, this->HDFS_READ_TIMEOUT_MS);
+         }
+     };
+ 

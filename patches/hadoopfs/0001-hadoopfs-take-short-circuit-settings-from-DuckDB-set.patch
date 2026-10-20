@@ -1,0 +1,54 @@
+From bf7354b2f2c77c22a73fab767851c276f6ad2820 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:47:51 +0300
+Subject: [PATCH 1/3] hadoopfs: take short-circuit settings from DuckDB
+ settings for hdfs://<namenode>/ URLs
+
+Upstream ignored hdfs_shortcircuit / hdfs_domain_socket_path for fully qualified
+hdfs://<namenode>/ paths (url params were used as is, with shortcircuit
+uninitialised), so short-circuit reads were never on. Session settings win over
+global ones. (Unchanged from the v1.4.1 build, hadoopfs-ext-v3.)
+---
+ src/hadoopfs.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/hadoopfs.cpp b/src/hadoopfs.cpp
+index 1ef9665..bffb13e 100644
+--- a/src/hadoopfs.cpp
++++ b/src/hadoopfs.cpp
+@@ -251,6 +251,8 @@ namespace duckdb
+             throw IOException("URL needs to start with hdfs://");
+         }
+         hdfs_params_out.url = url;
++        hdfs_params_out.shortcircuit = false;
++        hdfs_params_out.domain_socket_path = "";
+         auto slash_pos = url.find('/', 8);
+         if (slash_pos == string::npos)
+         {
+@@ -511,13 +513,22 @@ namespace duckdb
+ 
+         auto create_hdfs = [&]()
+         {
++            // The URL only names the namenode; short-circuit settings come from DuckDB settings
++            // (session first, then global). Upstream ignored them for hdfs://<namenode>/ paths, which
++            // left short-circuit reads permanently off for fully qualified URIs.
++            instance_hdfs_params = HDFSParams::ReadFrom(instance);
++            HDFSParams settings = instance_hdfs_params;
+             if (opener)
+             {
+-                ClientContext *context = opener->TryGetClientContext().get();
+-                opener_hdfs_params = HDFSParams::ReadFrom(*context);
++                auto context = opener->TryGetClientContext();
++                if (context)
++                {
++                    opener_hdfs_params = HDFSParams::ReadFrom(*context);
++                    settings = opener_hdfs_params;
++                }
+             }
+-
+-            instance_hdfs_params = HDFSParams::ReadFrom(instance);
++            url_hdfs_params.shortcircuit = settings.shortcircuit;
++            url_hdfs_params.domain_socket_path = settings.domain_socket_path;
+             auto hdfs_builder = hdfsNewBuilder();
+             setHdfsBuilderParams(hdfs_builder, url_hdfs_params);
+             return hdfsBuilderConnect(hdfs_builder);
