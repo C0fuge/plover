@@ -33,6 +33,7 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
 | date | run | DuckDB | arch | result | time | sha256 |
 |---|---|---|---|---|---|---|
 | 2026-10-20 | 39412215060 | v1.4.5 | amd64 | OK, patches 0001-0003 (`51b7220-afc1`) | 33m25s (deps 6m42s cold, ext 24m45s cold ccache) | 5e98988006240663d8a189e45c6f6d95fc6418724bb4149170d4fc4c52eb0234 |
+| 2026-10-22 | 39692669742 | v1.4.5 | amd64 | OK, patches 0001-0004 (`51b7220-afc2`) — **current** | 2m51s (deps cache hit, ext 64 s, ccache 396/401 hits) | e3c8b077d5041a820e0495cd04fce77a8acf86bd3144d000ccb07fef495d1bce |
 
 ## Verification (local, DuckDB JDBC 1.4.5 in an AlmaLinux 8 container)
 - `afc1`: loads (file must be named `hadoopfs.duckdb_extension`: DuckDB derives the init symbol from the file name);
@@ -43,7 +44,9 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
   path; each block whose first choice is the hung node pays one timeout); v1.4.1 build fails after 3 s with
   `No magic bytes found at end of file` (the production bug).
 - both DataNodes paused: new build fails with `IO Error: Failed to read from HDFS file ... HdfsTimeoutException` (no
-  short read), but only after 428 s with afc1 -> patch 0004.
+  short read), but only after 428 s with afc1 -> patch 0004; `afc2`: same error after 27 s, real offset in the message.
+- `afc2` repeated all of the above: same counts, short-circuit used, one DataNode hung -> correct results (12.4 s / 6.2 s /
+  12.2 s with SET 3 s), v1.4.1 build -> `TProtocolException: Invalid data` after 3.1 s (another short-read symptom).
 
 ## Open
 - HDFS machine-loss test on the bench (3 DataNodes, replication 2, silent disconnect): needs the bench stand
