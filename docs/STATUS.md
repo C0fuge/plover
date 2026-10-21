@@ -5,7 +5,7 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Layout
 - `sources.env` — pinned upstream commits / tarballs (+ sha256)
-- `patches/hadoopfs/` — patches on vincent-chang/duckdb-hdfs 51b7220
+- `patches/hadoopfs/` — patches on vincent-chang/duckdb-hdfs 51b7220 (footer version `51b7220-afcN`, N = patch level, set in `scripts/build-ext.sh`)
 - `patches/libhdfs3/` — patches on ClickHouse/libhdfs3 (none: the needed fix is upstream, pinned commit 94a9ead)
 - `scripts/build-deps.sh` — static protobuf 3.21.12, libgsasl 1.10.0, libhdfs3 -> /opt/deps (cached in CI)
 - `scripts/build-ext.sh` — DuckDB `$DUCKDB_VERSION` + extension, EXTENSION_STATIC_BUILD=1, ccache
@@ -22,6 +22,7 @@ OpenSSL. Everything else (libhdfs3, protobuf, gsasl, DuckDB, libstdc++) is insid
 | 0001 short-circuit settings | `hdfs_shortcircuit` / `hdfs_domain_socket_path` also apply to `hdfs://<namenode>/` URLs (upstream ignored them there). Same as the v1.4.1 build. |
 | 0002 IO errors | `hdfsRead() == -1` -> `IOException` with the libhdfs3 error; a positional `Read` that does not return all bytes -> `IOException` (was a silent short read -> "No magic bytes found at end of file" / "Variable-length int over 10 bytes"); write errors -> `IOException`; per-handle mutex around seek+read. |
 | 0003 timeouts | settings `hdfs_connect_timeout_ms`, `hdfs_read_timeout_ms` (BIGINT ms; env `HDFS_CONNECT_TIMEOUT_MS` / `HDFS_READ_TIMEOUT_MS`). Precedence: setting > LIBHDFS3_CONF (`input.connect.timeout`, `input.read.timeout`) > default 5000 / 15000 ms (libhdfs3 defaults 600 s / 3600 s). Applied when a namenode connection is first created. |
+| 0004 retry rounds, message | `input.read.max.retry` default 3 (libhdfs3 default 60: with every replica of a block hung a read failed only after 60 x (replicas x read timeout + 1 s), measured 428 s with 2 replicas @ 3 s); LIBHDFS3_CONF still wins. Read error message shows the real offset (was `-1`). |
 
 libhdfs3 replica failover on a DataNode read timeout: in ceb428c (used by the v1.4.1 build) a timeout while setting up the
 block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost DataNode) was not caught as an
@@ -31,3 +32,22 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
 ## Builds
 | date | run | DuckDB | arch | result | time | sha256 |
 |---|---|---|---|---|---|---|
+| 2026-10-20 | 39412215060 | v1.4.5 | amd64 | OK, patches 0001-0003 (`51b7220-afc1`) | 33m25s (deps 6m42s cold, ext 24m45s cold ccache) | 5e98988006240663d8a189e45c6f6d95fc6418724bb4149170d4fc4c52eb0234 |
+
+## Verification (local, DuckDB JDBC 1.4.5 in an AlmaLinux 8 container)
+- `afc1`: loads (file must be named `hadoopfs.duckdb_extension`: DuckDB derives the init symbol from the file name);
+  `hdfs_connect_timeout_ms` / `hdfs_read_timeout_ms` listed in `duckdb_settings()` (BIGINT, NULL by default), SET works.
+- isolated 2-DataNode HDFS 3.4.1 (replication 2, 8 MB blocks, TPC-H SF1 orders + customer): counts/sums identical to the
+  v1.4.1 build, short-circuit fd requests seen on the DataNode.
+- one DataNode paused (silent hang), read timeout 3 s: new build returns correct results (setting path and LIBHDFS3_CONF
+  path; each block whose first choice is the hung node pays one timeout); v1.4.1 build fails after 3 s with
+  `No magic bytes found at end of file` (the production bug).
+- both DataNodes paused: new build fails with `IO Error: Failed to read from HDFS file ... HdfsTimeoutException` (no
+  short read), but only after 428 s with afc1 -> patch 0004.
+
+## Open
+- HDFS machine-loss test on the bench (3 DataNodes, replication 2, silent disconnect): needs the bench stand
+  (afc-offline `bench/tools/agent-hadoopfs/hk.sh`).
+- libhdfs3 forgets a failed DataNode per block (failedNodes is cleared in seekToBlock), so until the namenode marks the
+  node dead (~10.5 min) every block that picks it first costs one read timeout. Upstream cb71a12 (slow-node isolation)
+  may help; not evaluated.

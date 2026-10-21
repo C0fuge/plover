@@ -1,0 +1,67 @@
+From 54d5a421dafe6d1f0acc9063ee5ad54f3425eff2 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:18:27 +0300
+Subject: [PATCH] hadoopfs: read error message shows the real offset;
+ input.read.max.retry default 3
+
+- "Failed to read from HDFS file ... at offset -1": hdfsTell() after a failed read
+  returns -1; take the position before hdfsRead().
+- When every replica of a block fails, libhdfs3 refreshes the block locations and
+  starts over up to input.read.max.retry times (default 60): with 2 hung replicas and
+  a 3 s read timeout a read failed only after 428 s (60 x (2 x 3 s + 1 s)); with the
+  15 s default it would be ~31 min. Default it to 3 rounds (like the Java client's
+  dfs.client.max.block.acquire.failures = 3); a value in LIBHDFS3_CONF still wins.
+  A single lost DataNode does not use these rounds (the next replica is read within
+  the same round).
+---
+ src/hadoopfs.cpp         | 8 +++++++-
+ src/include/hadoopfs.hpp | 2 ++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/hadoopfs.cpp b/src/hadoopfs.cpp
+index ea2e351..8a60b4d 100644
+--- a/src/hadoopfs.cpp
++++ b/src/hadoopfs.cpp
+@@ -184,6 +184,10 @@ namespace duckdb
+         setHdfsTimeout(hdfsBuilder, "input.connect.timeout", params.connect_timeout_ms, HDFSParams::DEFAULT_CONNECT_TIMEOUT_MS);
+         setHdfsTimeout(hdfsBuilder, "output.connect.timeout", params.connect_timeout_ms, HDFSParams::DEFAULT_CONNECT_TIMEOUT_MS);
+         setHdfsTimeout(hdfsBuilder, "input.read.timeout", params.read_timeout_ms, HDFSParams::DEFAULT_READ_TIMEOUT_MS);
++        // When every replica of a block failed, libhdfs3 refreshes the block locations and starts over, up to
++        // input.read.max.retry times (default 60, i.e. ~60 x (replicas x read timeout + 1 s) before a read fails).
++        // Like the Java client (dfs.client.max.block.acquire.failures = 3) give up after 3 rounds unless LIBHDFS3_CONF says otherwise.
++        setHdfsTimeout(hdfsBuilder, "input.read.max.retry", 0, HDFSParams::DEFAULT_READ_MAX_RETRY);
+ 
+         hdfsBuilderSetNameNode(hdfsBuilder, "default");
+         if (params.namenode != "default")
+@@ -710,12 +714,14 @@ namespace duckdb
+         }
+         // hdfsRead takes a 32-bit length
+         auto chunk = static_cast<tSize>(MinValue<int64_t>(nr_bytes, NumericLimits<int32_t>::Maximum()));
++        // position before the read: after a failed read hdfsTell() returns -1
++        auto position = hdfsTell(hfh.hdfs, hfh.hdfs_file);
+         auto length = hdfsRead(hfh.hdfs, hfh.hdfs_file, buffer, chunk);
+         if (length < 0)
+         {
+             const char *error = hdfsGetLastError();
+             throw IOException("Failed to read from HDFS file \"%s\" at offset %s: %s", handle.GetPath(),
+-                              to_string(hdfsTell(hfh.hdfs, hfh.hdfs_file)), error ? error : "unknown error");
++                              to_string(position), error ? error : "unknown error");
+         }
+         return length;
+     }
+diff --git a/src/include/hadoopfs.hpp b/src/include/hadoopfs.hpp
+index 2257f23..09f9d23 100644
+--- a/src/include/hadoopfs.hpp
++++ b/src/include/hadoopfs.hpp
+@@ -23,6 +23,8 @@ namespace duckdb
+         //! which turn a silently lost DataNode into a hang instead of a failover to the next replica)
+         static constexpr int64_t DEFAULT_CONNECT_TIMEOUT_MS = 5000;
+         static constexpr int64_t DEFAULT_READ_TIMEOUT_MS = 15000;
++        //! libhdfs3 input.read.max.retry (rounds over all replicas of a block) unless set in LIBHDFS3_CONF (libhdfs3 default 60)
++        static constexpr int64_t DEFAULT_READ_MAX_RETRY = 3;
+ 
+         string namenode = "default";
+         string url = "";
+-- 
+2.56.0
+
