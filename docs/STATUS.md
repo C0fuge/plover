@@ -49,8 +49,10 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
   12.2 s with SET 3 s), v1.4.1 build -> `TProtocolException: Invalid data` after 3.1 s (another short-read symptom).
 
 ## Open
-- HDFS machine-loss test on the bench (3 DataNodes, replication 2, silent disconnect): needs the bench stand
-  (afc-offline `bench/tools/agent-hadoopfs/hk.sh`).
+- HDFS machine-loss test on the bench DONE 2026-10-23 (afc-offline bench/tools/agent-hadoopfs/hk.sh, srv.sh; 3 DataNodes,
+  replication 2, SF10, one DataNode silently disconnected for 90 s): afc2 0 failures, correct results (direct DuckDB 234
+  queries; int6b server 63 queries); v1.4.1 build: `Snappy decompression failure` 16 s after the loss. During the outage
+  scans took 24-121 s instead of 1-4 s (repeated connect timeouts to the lost node, see next point).
 - libhdfs3 forgets a failed DataNode per block (failedNodes is cleared in seekToBlock), so until the namenode marks the
   node dead (~10.5 min) every block that picks it first costs one read timeout. Upstream cb71a12 (slow-node isolation)
   may help; not evaluated.
