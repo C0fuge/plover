@@ -36,7 +36,8 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
 | date | run | DuckDB | arch | result | time | sha256 |
 |---|---|---|---|---|---|---|
 | 2026-10-20 | 39412215060 | v1.4.5 | amd64 | OK, patches 0001-0003 (`51b7220-afc1`) | 33m25s (deps 6m42s cold, ext 24m45s cold ccache) | 5e98988006240663d8a189e45c6f6d95fc6418724bb4149170d4fc4c52eb0234 |
-| 2026-10-22 | 39692669742 | v1.4.5 | amd64 | OK, patches 0001-0004 (`51b7220-afc2`) — **current** | 2m51s (deps cache hit, ext 64 s, ccache 396/401 hits) | e3c8b077d5041a820e0495cd04fce77a8acf86bd3144d000ccb07fef495d1bce |
+| 2026-10-22 | 39692669742 | v1.4.5 | amd64 | OK, patches 0001-0004 (`51b7220-afc2`) | 2m51s (deps cache hit, ext 64 s, ccache 396/401 hits) | e3c8b077d5041a820e0495cd04fce77a8acf86bd3144d000ccb07fef495d1bce |
+| 2026-10-23 | 39952752512 | v1.4.5 | amd64 | OK, patches 0001-0005 + libhdfs3 0001 (`51b7220-afc3`) — **current** | 10m14s (unit tests 4 s, deps rebuild 6m51s, ext 88 s) | 044b5162efed99cb2df395ec2344b80fa5dc07c2a009525b814be9ba32cadecb |
 
 ## Verification (local, DuckDB JDBC 1.4.5 in an AlmaLinux 8 container)
 - `afc1`: loads (file must be named `hadoopfs.duckdb_extension`: DuckDB derives the init symbol from the file name);
@@ -56,6 +57,9 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
   replication 2, SF10, one DataNode silently disconnected for 90 s): afc2 0 failures, correct results (direct DuckDB 234
   queries; int6b server 63 queries); v1.4.1 build: `Snappy decompression failure` 16 s after the loss. During the outage
   scans took 24-121 s instead of 1-4 s (repeated connect timeouts to the lost node, see next point).
-- libhdfs3 forgets a failed DataNode per block (failedNodes is cleared in seekToBlock), so until the namenode marks the
-  node dead (~10.5 min) every block that picks it first costs one read timeout. Upstream cb71a12 (slow-node isolation)
-  may help; not evaluated.
+- afc3 (libhdfs3 0001 dead-node list, TTL 60 s) fixes the slow failover. Same test, 2026-10-23: direct DuckDB k4 (afc2 = k3):
+  0 failures, correct; lineitem scan max during the outage 15.5 / 17.3 s with defaults 5 s/15 s (k3 106.7 / 98.4 s), 3.8 s with
+  SET connect 3 s (k3 120.6 s), median 0.4-0.6 s; 32-77 queries per probe during the outage (k3: 1-2). int6b server s2 (S-s1 =
+  afc2): 414 queries, 0 failures, correct; during the 90 s outage 116 queries (S-s1: 3), max li 0.2 s (24.5 s), ord 22.1 s
+  (60.6 s, the first query after the loss), join 11.3 s (34.0 s), all others 0.1-0.3 s. The first reads that meet the lost
+  node still pay one connect/read timeout each (before it is on the list).
