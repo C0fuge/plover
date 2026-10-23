@@ -45,6 +45,9 @@ jobs:
           dnf install -y -q epel-release >/dev/null && dnf install -y -q ccache >/dev/null || echo "no ccache"
           gcc --version | head -1; cmake --version | head -1; nproc
 
+      - name: unit tests (libhdfs3 patches)
+        run: bash scripts/test-libhdfs3.sh
+
       - name: deps cache
         id: deps
         uses: actions/cache/restore@v4

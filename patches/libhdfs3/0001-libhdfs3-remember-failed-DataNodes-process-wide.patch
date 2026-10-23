@@ -1,0 +1,399 @@
+From f92d2932cd69c2515cb4ac829b9cba3b9b5ec127 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 15:20:11 +0300
+Subject: [PATCH] Remember failed DataNodes process-wide with an expiry
+ (input.deadnode.ttl)
+
+InputStreamImpl forgets a failed DataNode at every block (seekToBlock clears
+failedNodes) and in every new stream. While a DataNode is silently lost (and
+the namenode still lists it, ~10.5 min), every block / seek / file whose
+replica order starts with it pays the connect or read timeout again. Readers
+that seek a lot (DuckDB parquet) then take 24-121 s for a scan instead of
+1-4 s.
+
+New: DeadNodes, a process-wide list keyed by DataNode UUID@ip:xferPort.
+A node whose remote block reader fails (setup timeout / IO error, or a read
+error mid-block) is remembered for input.deadnode.ttl ms (default 60000,
+0 = off = old behaviour). choseBestNode prefers replicas that are neither
+failed for the block nor on the list; a listed node is still tried when it
+is the only replica left. A successful block reader setup on a node removes
+it at once. EC (striped) reads are unchanged.
+---
+ src/client/DeadNodes.cpp       | 78 ++++++++++++++++++++++++++++++
+ src/client/DeadNodes.h         | 86 ++++++++++++++++++++++++++++++++++
+ src/client/InputStreamImpl.cpp | 62 ++++++++++++++++--------
+ src/common/SessionConfig.cpp   |  2 +
+ src/common/SessionConfig.h     |  9 ++++
+ 5 files changed, 217 insertions(+), 20 deletions(-)
+ create mode 100644 src/client/DeadNodes.cpp
+ create mode 100644 src/client/DeadNodes.h
+
+diff --git a/src/client/DeadNodes.cpp b/src/client/DeadNodes.cpp
+new file mode 100644
+index 0000000..281faef
+--- /dev/null
++++ b/src/client/DeadNodes.cpp
+@@ -0,0 +1,78 @@
++/*
++ * Process-wide dead DataNode list with expiry (afc patch). Without it libhdfs3 forgets a failed DataNode at every
++ * block (InputStreamImpl::seekToBlock clears failedNodes) and in every new stream, so while a DataNode is silently
++ * lost each read that the namenode orders to it first pays the connect/read timeout again.
++ */
++#include "DeadNodes.h"
++
++namespace Hdfs {
++namespace Internal {
++
++DeadNodes & DeadNodes::instance() {
++    static DeadNodes * nodes = new DeadNodes();  // never destroyed: used by streams closed during exit
++    return *nodes;
++}
++
++bool DeadNodes::markDead(const std::string & key, int64_t ttlMs, Clock::time_point now) {
++    if (ttlMs <= 0) {
++        return false;
++    }
++
++    Clock::time_point until = now + std::chrono::milliseconds(ttlMs);
++    std::lock_guard<std::mutex> lock(mu);
++    auto it = expiry.find(key);
++
++    if (it == expiry.end()) {
++        expiry.emplace(key, until);
++        count.store(expiry.size(), std::memory_order_relaxed);
++        return true;
++    }
++
++    bool wasAlive = it->second <= now;
++    if (it->second < until) {
++        it->second = until;
++    }
++
++    return wasAlive;
++}
++
++bool DeadNodes::isDead(const std::string & key, Clock::time_point now) {
++    if (size() == 0) {
++        return false;
++    }
++
++    std::lock_guard<std::mutex> lock(mu);
++    auto it = expiry.find(key);
++
++    if (it == expiry.end()) {
++        return false;
++    }
++
++    if (it->second <= now) {
++        expiry.erase(it);
++        count.store(expiry.size(), std::memory_order_relaxed);
++        return false;
++    }
++
++    return true;
++}
++
++bool DeadNodes::markAlive(const std::string & key) {
++    if (size() == 0) {
++        return false;
++    }
++
++    std::lock_guard<std::mutex> lock(mu);
++    bool found = expiry.erase(key) > 0;
++    count.store(expiry.size(), std::memory_order_relaxed);
++    return found;
++}
++
++void DeadNodes::clear() {
++    std::lock_guard<std::mutex> lock(mu);
++    expiry.clear();
++    count.store(0, std::memory_order_relaxed);
++}
++
++}
++}
+diff --git a/src/client/DeadNodes.h b/src/client/DeadNodes.h
+new file mode 100644
+index 0000000..6731805
+--- /dev/null
++++ b/src/client/DeadNodes.h
+@@ -0,0 +1,86 @@
++/*
++ * Process-wide memory of DataNodes that recently failed (afc patch, see DeadNodes.cpp).
++ */
++#ifndef _HDFS_LIBHDFS3_CLIENT_DEADNODES_H_
++#define _HDFS_LIBHDFS3_CLIENT_DEADNODES_H_
++
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++namespace Hdfs {
++namespace Internal {
++
++/**
++ * DataNodes whose remote block reader failed (connect / read timeout, IO error) are remembered for a TTL
++ * ("input.deadnode.ttl", ms) by every input stream of the process, not only for the current block of one stream:
++ * while a DataNode is silently gone (and the namenode still lists it), each new block, seek or file would otherwise
++ * try it first again and pay a full connect/read timeout. Replica choice prefers nodes that are not remembered as
++ * dead; a dead one is still used when it is the only replica left. A successful block reader setup on a node
++ * forgets it at once. Key = DataNode UUID + "@" + ip:xferPort (a node that comes back with a new address is new).
++ */
++class DeadNodes {
++public:
++    typedef std::chrono::steady_clock Clock;
++
++    static DeadNodes & instance();
++
++    /** remember key as dead until now + ttlMs (ttlMs <= 0: no-op). Returns true if it was not dead before. */
++    bool markDead(const std::string & key, int64_t ttlMs, Clock::time_point now = Clock::now());
++
++    /** true if key failed less than its TTL ago (expired entries are dropped). */
++    bool isDead(const std::string & key, Clock::time_point now = Clock::now());
++
++    /** forget key (called after a successful block reader setup). Returns true if it was remembered. */
++    bool markAlive(const std::string & key);
++
++    /** number of remembered entries (expired ones included until looked up). */
++    size_t size() const {
++        return count.load(std::memory_order_relaxed);
++    }
++
++    void clear();
++
++    /**
++     * Replica choice: index of the first node that is not failed for this read and not remembered as dead; else the
++     * first node that is not failed (dead, but the only choice left); else -1.
++     * isFailed(i) = node i already failed for the current block; keyOf(i) = its dead-node key.
++     */
++    template <typename IsFailed, typename KeyOf>
++    int choose(size_t n, IsFailed isFailed, KeyOf keyOf, bool consult, Clock::time_point now = Clock::now()) {
++        int fallback = -1;
++        bool any = consult && size() > 0;
++
++        for (size_t i = 0; i < n; ++i) {
++            if (isFailed(i)) {
++                continue;
++            }
++
++            if (any && isDead(keyOf(i), now)) {
++                if (fallback < 0) {
++                    fallback = static_cast<int>(i);
++                }
++
++                continue;
++            }
++
++            return static_cast<int>(i);
++        }
++
++        return fallback;
++    }
++
++private:
++    mutable std::mutex mu;
++    std::unordered_map<std::string, Clock::time_point> expiry;
++    std::atomic<size_t> count{0};
++};
++
++}
++}
++
++#endif /* _HDFS_LIBHDFS3_CLIENT_DEADNODES_H_ */
+diff --git a/src/client/InputStreamImpl.cpp b/src/client/InputStreamImpl.cpp
+index c549cce..7a142bd 100644
+--- a/src/client/InputStreamImpl.cpp
++++ b/src/client/InputStreamImpl.cpp
+@@ -26,6 +26,7 @@
+  * limitations under the License.
+  */
+ #include "Exception.h"
++#include "DeadNodes.h"
+ #include "ExceptionInternal.h"
+ #include "FileSystemInter.h"
+ #include "InputStreamImpl.h"
+@@ -47,6 +48,30 @@
+ namespace Hdfs {
+ namespace Internal {
+ 
++/*
++ * Process-wide dead DataNode list (see DeadNodes.h): a node whose remote block reader failed is avoided by every
++ * stream for input.deadnode.ttl ms instead of only for the current block of the current stream.
++ */
++static std::string deadNodeKey(const DatanodeInfo & node) {
++    return node.getDatanodeId() + "@" + node.getXferAddr();
++}
++
++static void rememberDeadNode(const DatanodeInfo & node, const SessionConfig & conf) {
++    int32_t ttl = conf.getDeadNodeTtl();
++
++    if (ttl > 0 && DeadNodes::instance().markDead(deadNodeKey(node), ttl)) {
++        LOG(WARNING, "InputStreamImpl: Datanode %s failed, other replicas are preferred for the next %d ms.",
++            node.formatAddress().c_str(), ttl);
++    }
++}
++
++static void forgetDeadNode(const DatanodeInfo & node) {
++    if (DeadNodes::instance().size() > 0 && DeadNodes::instance().markAlive(deadNodeKey(node))) {
++        LOG(INFO, "InputStreamImpl: Datanode %s answered again, removed from the dead node list.",
++            node.formatAddress().c_str());
++    }
++}
++
+ unordered_set<std::string> BuildLocalAddrSet() {
+     unordered_set<std::string> set;
+     struct ifaddrs * ifAddr = NULL;
+@@ -320,33 +345,22 @@ void InputStreamImpl::seekToBlock(const LocatedBlock & lb) {
+ }
+ 
+ bool InputStreamImpl::choseBestNode() {
+-    const std::vector<DatanodeInfo> & nodes = curBlock->getLocations();
+-
+-    for (size_t i = 0; i < nodes.size(); ++i) {
+-        if (failedNodes.binary_search(nodes[i])) {
+-            continue;
+-        }
+-
+-        curNode = nodes[i];
+-        return true;
+-    }
+-
+-    return false;
++    return choseBestNode(curBlock, curNode);
+ }
+ 
+ bool InputStreamImpl::choseBestNode(shared_ptr<LocatedBlock> curBlock, DatanodeInfo & curNode) {
+     const std::vector<DatanodeInfo> & nodes = curBlock->getLocations();
++    /* not failed for this block and not on the process-wide dead list; else a dead one if nothing else is left */
++    int i = DeadNodes::instance().choose(
++        nodes.size(), [&](size_t k) { return failedNodes.binary_search(nodes[k]); },
++        [&](size_t k) { return deadNodeKey(nodes[k]); }, conf->getDeadNodeTtl() > 0);
+ 
+-    for (size_t i = 0; i < nodes.size(); ++i) {
+-        if (failedNodes.binary_search(nodes[i])) {
+-            continue;
+-        }
+-
+-        curNode = nodes[i];
+-        return true;
++    if (i < 0) {
++        return false;
+     }
+ 
+-    return false;
++    curNode = nodes[i];
++    return true;
+ }
+ 
+ bool InputStreamImpl::isLocalNode() {
+@@ -422,6 +436,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
+                     curBlock->getToken(), clientName, verify, *conf));
+             }
+ 
++            forgetDeadNode(curNode);
+             break;
+         } catch (const HdfsTimeoutException & e) {
+             lastException = current_exception();
+@@ -432,6 +447,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
+                 curNode.formatAddress().c_str(), GetExceptionDetail(e, buffer));
+             failedNodes.push_back(curNode);
+             failedNodes.sort();
++            rememberDeadNode(curNode, *conf);
+         } catch (const HdfsIOException & e) {
+             lastException = current_exception();
+             std::string buffer;
+@@ -453,6 +469,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
+                     curNode.formatAddress().c_str(), GetExceptionDetail(e, buffer));
+                 failedNodes.push_back(curNode);
+                 failedNodes.sort();
++                rememberDeadNode(curNode, *conf);
+             }
+         }
+     }
+@@ -523,6 +540,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
+                         curBlock->getToken(), clientName, verify, *conf));
+             }
+ 
++            forgetDeadNode(curNode);
+             break;
+         } catch (const HdfsTimeoutException & e) {
+             lastException = current_exception();
+@@ -533,6 +551,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
+                 curNode.formatAddress().c_str(), GetExceptionDetail(e, buffer));
+             failedNodes.push_back(curNode);
+             failedNodes.sort();
++            rememberDeadNode(curNode, *conf);
+         } catch (const HdfsIOException & e) {
+             lastException = current_exception();
+             std::string buffer;
+@@ -554,6 +573,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
+                     curNode.formatAddress().c_str(), GetExceptionDetail(e, buffer));
+                 failedNodes.push_back(curNode);
+                 failedNodes.sort();
++                rememberDeadNode(curNode, *conf);
+             }
+         }
+     }
+@@ -719,6 +739,7 @@ int32_t InputStreamImpl::readOneBlock(char * buf, int32_t size, bool shouldUpdat
+                 curNode.formatAddress().c_str(), path.c_str());
+             failedNodes.push_back(curNode);
+             failedNodes.sort();
++            rememberDeadNode(curNode, *conf);
+         }
+ 
+         blockReader.reset();
+@@ -1062,6 +1083,7 @@ void InputStreamImpl::fetchBlockByteRange(shared_ptr<LocatedBlock> curBlock, int
+                 curNode.formatAddress().c_str(), path.c_str());
+             failedNodes.push_back(curNode);
+             failedNodes.sort();
++            rememberDeadNode(curNode, *conf);
+         }
+ 
+         blockReader.reset();
+diff --git a/src/common/SessionConfig.cpp b/src/common/SessionConfig.cpp
+index e910617..a94cce9 100644
+--- a/src/common/SessionConfig.cpp
++++ b/src/common/SessionConfig.cpp
+@@ -108,6 +108,8 @@ SessionConfig::SessionConfig(const Config & conf) {
+             &maxLocalBlockInfoCacheSize, "input.localread.blockinfo.cachesize", 1000, bind(CheckRangeGE<int32_t>, _1, _2, 1)
+         }, {
+             &maxReadBlockRetry, "input.read.max.retry", 60, bind(CheckRangeGE<int32_t>, _1, _2, 1)
++        }, {
++            &deadNodeTtl, "input.deadnode.ttl", 60 * 1000, bind(CheckRangeGE<int32_t>, _1, _2, 0)
+         }, {
+             &chunkSize, "output.default.chunksize", 512, bind(CheckMultipleOf<int32_t>, _1, _2, 512)
+         }, {
+diff --git a/src/common/SessionConfig.h b/src/common/SessionConfig.h
+index eb0c9ce..644544f 100644
+--- a/src/common/SessionConfig.h
++++ b/src/common/SessionConfig.h
+@@ -135,6 +135,14 @@ public:
+         return maxGetBlockInfoRetry;
+     }
+ 
++    /*
++     * ms a DataNode whose block reader failed is avoided by all streams of the process
++     * (preferred last among the replicas); 0 = off (only the current block of the stream avoids it)
++     */
++    int32_t getDeadNodeTtl() const {
++        return deadNodeTtl;
++    }
++
+     int32_t getMaxLocalBlockInfoCacheSize() const {
+         return maxLocalBlockInfoCacheSize;
+     }
+@@ -356,6 +364,7 @@ public:
+     int32_t maxGetBlockInfoRetry;
+     int32_t maxLocalBlockInfoCacheSize;
+     int32_t maxReadBlockRetry;
++    int32_t deadNodeTtl;
+     int32_t prefetchSize;
+     int32_t socketCacheCapacity;
+     int32_t socketCacheExpiry;
+-- 
+2.56.0
+

@@ -6,8 +6,8 @@ source "$(dirname "$0")/common.sh"
 DUCKDB_VERSION=${DUCKDB_VERSION:-v1.4.5}
 # Extension version in the footer = upstream commit + our patch level. Set here, not in sources.env: sources.env is part of
 # the deps cache key, and bumping the patch level must not rebuild protobuf/gsasl/libhdfs3. (afc1 = patches 0001-0003,
-# afc2 = + 0004)
-HADOOPFS_EXT_VERSION=${HADOOPFS_COMMIT:0:7}-afc2
+# afc2 = + 0004, afc3 = + 0005 and patches/libhdfs3/0001)
+HADOOPFS_EXT_VERSION=${HADOOPFS_COMMIT:0:7}-afc3
 OUT=${OUT_DIR:-$WORK/out}
 case "$(uname -m)" in x86_64) PLATFORM=linux_amd64 ;; aarch64) PLATFORM=linux_arm64 ;; *) echo "unknown arch"; exit 1 ;; esac
 mkdir -p "$WORK" "$OUT" && cd "$WORK"

@@ -1,0 +1,135 @@
+From faca24654159eff74e38507e53f81c62f483576e Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 15:21:10 +0300
+Subject: [PATCH] hadoopfs: hdfs_dead_node_ttl_ms setting (process-wide dead
+ DataNode list)
+
+New setting hdfs_dead_node_ttl_ms (BIGINT ms, env HDFS_DEAD_NODE_TTL_MS) ->
+libhdfs3 input.deadnode.ttl (patched libhdfs3, patches/libhdfs3/0001): a
+DataNode whose block reader failed is avoided by every read of the process
+for that long (other replicas first, still used if it is the only one); a
+successful read from it clears it. 0 = off. Precedence: setting (>= 0) >
+LIBHDFS3_CONF > default 60000. Read when the extension first connects to a
+namenode, like the timeouts.
+---
+ src/hadoopfs.cpp         | 17 +++++++++++++++++
+ src/include/hadoopfs.hpp | 13 +++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/src/hadoopfs.cpp b/src/hadoopfs.cpp
+index 8a60b4d..c333f3b 100644
+--- a/src/hadoopfs.cpp
++++ b/src/hadoopfs.cpp
+@@ -188,6 +188,18 @@ namespace duckdb
+         // input.read.max.retry times (default 60, i.e. ~60 x (replicas x read timeout + 1 s) before a read fails).
+         // Like the Java client (dfs.client.max.block.acquire.failures = 3) give up after 3 rounds unless LIBHDFS3_CONF says otherwise.
+         setHdfsTimeout(hdfsBuilder, "input.read.max.retry", 0, HDFSParams::DEFAULT_READ_MAX_RETRY);
++        // A DataNode whose block reader failed is avoided by every stream of the process for this long (libhdfs3
++        // patch: process-wide dead-node list; still used if it is the only replica). Without it each new block/seek
++        // that lists the lost node first pays the connect/read timeout again. Setting (>= 0, 0 = off) > LIBHDFS3_CONF > default.
++        if (params.dead_node_ttl_ms >= 0)
++        {
++            hdfsBuilderConfSetStr(hdfsBuilder, "input.deadnode.ttl",
++                                  to_string(MinValue<int64_t>(params.dead_node_ttl_ms, NumericLimits<int32_t>::Maximum())).c_str());
++        }
++        else
++        {
++            setHdfsTimeout(hdfsBuilder, "input.deadnode.ttl", 0, HDFSParams::DEFAULT_DEAD_NODE_TTL_MS);
++        }
+ 
+         hdfsBuilderSetNameNode(hdfsBuilder, "default");
+         if (params.namenode != "default")
+@@ -458,6 +470,10 @@ namespace duckdb
+                                   "HDFS DataNode read timeout in ms; on timeout the next replica is read "
+                                   "(NULL: LIBHDFS3_CONF value, else 15000)",
+                                   LogicalType::BIGINT, Value());
++        config.AddExtensionOption(HDFSParams::HDFS_DEAD_NODE_TTL_MS,
++                                  "HDFS: ms a failed DataNode is avoided by all reads of the process (other replicas "
++                                  "first); 0 = off (NULL: LIBHDFS3_CONF input.deadnode.ttl, else 60000)",
++                                  LogicalType::BIGINT, Value());
+ 
+         auto provider = duckdb::make_uniq<HDFSEnvironmentSettingsProvider>(config);
+         provider->SetAll();
+@@ -568,6 +584,7 @@ namespace duckdb
+             url_hdfs_params.domain_socket_path = settings.domain_socket_path;
+             url_hdfs_params.connect_timeout_ms = settings.connect_timeout_ms;
+             url_hdfs_params.read_timeout_ms = settings.read_timeout_ms;
++            url_hdfs_params.dead_node_ttl_ms = settings.dead_node_ttl_ms;
+             auto hdfs_builder = hdfsNewBuilder();
+             setHdfsBuilderParams(hdfs_builder, url_hdfs_params);
+             return hdfsBuilderConnect(hdfs_builder);
+diff --git a/src/include/hadoopfs.hpp b/src/include/hadoopfs.hpp
+index 09f9d23..0eaac26 100644
+--- a/src/include/hadoopfs.hpp
++++ b/src/include/hadoopfs.hpp
+@@ -19,12 +19,15 @@ namespace duckdb
+         static constexpr const char *HDFS_DOMAIN_SOCKET_PATH = "hdfs_domain_socket_path";
+         static constexpr const char *HDFS_CONNECT_TIMEOUT_MS = "hdfs_connect_timeout_ms";
+         static constexpr const char *HDFS_READ_TIMEOUT_MS = "hdfs_read_timeout_ms";
++        static constexpr const char *HDFS_DEAD_NODE_TTL_MS = "hdfs_dead_node_ttl_ms";
+         //! used when neither the DuckDB setting nor LIBHDFS3_CONF sets a value (libhdfs3's own defaults are 600 s / 3600 s,
+         //! which turn a silently lost DataNode into a hang instead of a failover to the next replica)
+         static constexpr int64_t DEFAULT_CONNECT_TIMEOUT_MS = 5000;
+         static constexpr int64_t DEFAULT_READ_TIMEOUT_MS = 15000;
+         //! libhdfs3 input.read.max.retry (rounds over all replicas of a block) unless set in LIBHDFS3_CONF (libhdfs3 default 60)
+         static constexpr int64_t DEFAULT_READ_MAX_RETRY = 3;
++        //! libhdfs3 input.deadnode.ttl (patched libhdfs3) unless set in DuckDB or LIBHDFS3_CONF
++        static constexpr int64_t DEFAULT_DEAD_NODE_TTL_MS = 60000;
+ 
+         string namenode = "default";
+         string url = "";
+@@ -34,6 +37,8 @@ namespace duckdb
+         //! <= 0: not set in DuckDB (LIBHDFS3_CONF value, else the default above)
+         int64_t connect_timeout_ms = 0;
+         int64_t read_timeout_ms = 0;
++        //! < 0: not set in DuckDB (LIBHDFS3_CONF value, else the default); 0 = off
++        int64_t dead_node_ttl_ms = -1;
+ 
+         template <typename T>
+         static HDFSParams ReadFrom(T &config)
+@@ -44,6 +49,7 @@ namespace duckdb
+             string domain_socket_path = "";
+             int64_t connect_timeout_ms = 0;
+             int64_t read_timeout_ms = 0;
++            int64_t dead_node_ttl_ms = -1;
+             Value value;
+ 
+             if (config.TryGetCurrentSetting(HDFSParams::HDFS_DEFAULT_NAMENODE, value))
+@@ -87,6 +93,10 @@ namespace duckdb
+             {
+                 read_timeout_ms = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
+             }
++            if (config.TryGetCurrentSetting(HDFSParams::HDFS_DEAD_NODE_TTL_MS, value) && !value.IsNull())
++            {
++                dead_node_ttl_ms = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
++            }
+             HDFSParams result;
+             result.namenode = namenode;
+             result.url = "";
+@@ -95,6 +105,7 @@ namespace duckdb
+             result.domain_socket_path = domain_socket_path;
+             result.connect_timeout_ms = connect_timeout_ms;
+             result.read_timeout_ms = read_timeout_ms;
++            result.dead_node_ttl_ms = dead_node_ttl_ms;
+             return result;
+         }
+         // static HDFSParams ReadFrom(DatabaseInstance &instance);
+@@ -109,6 +120,7 @@ namespace duckdb
+         static constexpr const char *HDFS_DOMAIN_SOCKET_PATH = "HDFS_DOMAIN_SOCKET_PATH";
+         static constexpr const char *HDFS_CONNECT_TIMEOUT_MS = "HDFS_CONNECT_TIMEOUT_MS";
+         static constexpr const char *HDFS_READ_TIMEOUT_MS = "HDFS_READ_TIMEOUT_MS";
++        static constexpr const char *HDFS_DEAD_NODE_TTL_MS = "HDFS_DEAD_NODE_TTL_MS";
+ 
+         explicit HDFSEnvironmentSettingsProvider(DBConfig &config) : config(config){};
+ 
+@@ -142,6 +154,7 @@ namespace duckdb
+             this->SetExtensionOptionValue(HDFSParams::HDFS_DOMAIN_SOCKET_PATH, this->HDFS_DOMAIN_SOCKET_PATH);
+             this->SetExtensionOptionValue(HDFSParams::HDFS_CONNECT_TIMEOUT_MS, this->HDFS_CONNECT_TIMEOUT_MS);
+             this->SetExtensionOptionValue(HDFSParams::HDFS_READ_TIMEOUT_MS, this->HDFS_READ_TIMEOUT_MS);
++            this->SetExtensionOptionValue(HDFSParams::HDFS_DEAD_NODE_TTL_MS, this->HDFS_DEAD_NODE_TTL_MS);
+         }
+     };
+ 
+-- 
+2.56.0
+
