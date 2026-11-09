@@ -1,7 +1,7 @@
 #!/bin/bash
 # Inside almalinux:8 with host network (see hdfs-test.yml). Needs ext/hadoopfs.duckdb_extension and HDFS on localhost.
 set -euo pipefail
-dnf install -y -q libxml2 krb5-libs libuuid openssl-libs python3 >/dev/null
+dnf install -y -q libxml2 krb5-libs libuuid openssl-libs python3 diffutils >/dev/null
 D=$PWD/duckdb  # CLI downloaded by the workflow
 EXT=$PWD/ext/hadoopfs.duckdb_extension
 (cd ext && sha256sum -c hadoopfs.duckdb_extension.sha256)
@@ -10,7 +10,8 @@ JMX='http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=NameNodeActivity
 N=${N:-20}
 n_files=$(ls data/*.parquet | wc -l)
 
-rpcs() { curl -sSf "$JMX" | python3 -c 'import json,sys; b=json.load(sys.stdin)["beans"][0]; print(b["FileInfoOps"], b["GetBlockLocations"], b["GetListingOps"])'; }
+# JMX values are cached for one metrics period (10 s): wait it out, or two reads 1 s apart show the same counters
+rpcs() { sleep 11; curl -sSf "$JMX" | python3 -c 'import json,sys; b=json.load(sys.stdin)["beans"][0]; print(b["FileInfoOps"], b["GetBlockLocations"], b["GetListingOps"])'; }
 # phase <ttl_ms>: one DuckDB process, N point queries; prints the RPC deltas
 phase() {
   local ttl=$1 sql=/tmp/q_$1.sql
@@ -29,7 +30,8 @@ diff /tmp/out_0.csv /tmp/out_600000.csv && echo "results identical ($(wc -l < /t
 [ "$(wc -l < /tmp/out_0.csv)" = "$N" ]
 off=$(cat /tmp/total_0); on=$(cat /tmp/total_600000)
 echo "NameNode getfileinfo+getBlockLocations per query: off $((off / N)), on $((on / N)) (total $off -> $on)"
-[ "$on" -le $(( n_files * 2 + 2 )) ] || { echo "FAIL: cache on still costs $on calls"; exit 1; }
+[ "$off" -ge "$N" ] || { echo "FAIL: cache off counted only $off calls (metrics not read?)"; exit 1; }
+[ "$on" -lt "$off" ] && [ "$on" -le $(( n_files * 2 + 2 )) ] || { echo "FAIL: cache on still costs $on calls"; exit 1; }
 
 # full scan identical, cache on and off
 for ttl in 0 600000; do
