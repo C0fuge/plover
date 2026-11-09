@@ -3,6 +3,31 @@
 DuckDB `hadoopfs` (hdfs://) extension, rebuilt for DuckDB v1.4.5 (linux_amd64; arm64 optional) with HDFS
 read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.env`); only our patches live here.
 
+## Next steps
+
+> **Maintainer, 2026-11-09 18:20 - ITEM P1 (first): cut the NameNode round trips per query (server item 39 (c), Q9).**
+> Measured by the server's HDFS point-query cell: every point query opens every Parquet file of its table about 5 times
+> (once per row group scanned + footer + bind), and every open comes with a `getfileinfo` (the stat before open) and
+> a `getBlockLocations`: ~20 opens + ~20 `getfileinfo` NameNode RPCs per point query. On a real Kerberos + SASL
+> (privacy) cluster that is tens of NameNode round trips per query - the likeliest cause of the server's point-query
+> collapse there (13-27 q/s, CPU idle). Do in a patch `0006`:
+> (a) a process-wide metadata cache in the extension: file status (length, mtime, isdir) and located blocks per path,
+>     TTL setting `hdfs_metadata_cache_ttl_ms` (BIGINT ms, env `HDFS_METADATA_CACHE_TTL_MS`, default 0 = off for now;
+>     the server will set it), invalidated when a fresh stat shows another length/mtime, never caching errors; bounded
+>     size (LRU, e.g. 10 000 entries); `getfileinfo` for `FileExists`/`GetFileSize`/`GetLastModifiedTime` served from it;
+> (b) reuse an open libhdfs3 input stream (and its located blocks) across the row-group reads of one DuckDB file handle
+>     instead of re-opening (check where DuckDB opens per row group: `OpenFile` per scan state vs the extension);
+> (c) make the extension report the file's modification time correctly (DuckDB's Parquet metadata cache and external
+>     file cache rely on it) - test it.
+> Tests: unit tests where possible (no HDFS), and a check on a single-node HDFS in CI (Hadoop 3.x container, like the
+> server's cells) counting NameNode RPCs per repeated `SELECT ... WHERE id = k` before/after (NameNode audit log or
+> RPC metrics). Build for **DuckDB v1.5.6** (the server's version) amd64, footer version `51b7220-afc4`; record the run
+> and sha256 in "Builds". Then attach the extension + `.sha256` to a release `hadoopfs-51b7220-afc4-duckdb-v1.5.6` here
+> and write "P1 DONE <release>" - the server lanes take it from there.
+> **P2 (after P1, research only, write findings here):** can libhdfs3 (ClickHouse fork) do the SASL data-transfer
+> handshake (`dfs.data.transfer.protection` authentication/privacy, `dfs.encrypt.data.transfer`)? Which upstream
+> commits/PRs, how big a patch; that would let DuckDB read non-local blocks without the server's local copies.
+
 ## Layout
 - `sources.env` — pinned upstream commits / tarballs (+ sha256)
 - `patches/hadoopfs/` — patches on vincent-chang/duckdb-hdfs 51b7220 (footer version `51b7220-afcN`, N = patch level, set in `scripts/build-ext.sh`)
