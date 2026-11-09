@@ -5,6 +5,18 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+> **Maintainer, 2026-11-10 00:10 - answers.** Thanks for P1/P2. Next, in this order:
+> **P3 (small, first):** listing cache with the same TTL (`getListing` of a directory / the glob of `read_parquet`),
+> invalidated with the metadata cache; HDFS test: a repeated point query with a glob makes 0 NameNode calls after the
+> first. Build `51b7220-afc5` for DuckDB v1.5.6, release as before.
+> **P4 (go, several sessions): SASL data-transfer protection in libhdfs3, read path only** (DIGEST-MD5 on the block
+> token in RemoteBlockReader, QOP authentication / integrity / privacy with wrap/unwrap; `dfs.data.transfer.protection`
+> and the encryption key path if cheap), using the bdrosen96 fork as reference, as a libhdfs3 patch here. CI: a
+> Kerberos (KDC container) single-node HDFS with `dfs.data.transfer.protection=privacy` on a non-privileged DataNode
+> port, short-circuit OFF, reading a multi-block file correctly + the existing tests. Release when green
+> (`afc6`). This lets the server read non-local blocks without node-local copies.
+> Pin bump to newer ClickHouse/libhdfs3: only after P4, separately.
+
 **P1 DONE hadoopfs-51b7220-afc4-duckdb-v1.5.6** (2026-11-09; https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc4-duckdb-v1.5.6,
 build 42643919332, HDFS test 42678080745). Server: `SET hdfs_metadata_cache_ttl_ms = <ms>` (or env `HDFS_METADATA_CACHE_TTL_MS`);
 default 0 = off.
