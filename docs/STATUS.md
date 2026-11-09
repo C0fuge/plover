@@ -5,6 +5,37 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+**P1 DONE hadoopfs-51b7220-afc4-duckdb-v1.5.6** (2026-11-09; https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc4-duckdb-v1.5.6,
+build 42643919332, HDFS test 42678080745). Server: `SET hdfs_metadata_cache_ttl_ms = <ms>` (or env `HDFS_METADATA_CACHE_TTL_MS`);
+default 0 = off.
+
+**P2 findings (research, 2026-11-09)** - libhdfs3 SASL data-transfer protection:
+- ClickHouse/libhdfs3 (our pin 94a9ead and master 85dabf0, 2026-11-05) has **no** data-transfer SASL: `dfs.data.transfer.protection`
+  and `dfs.encrypt.data.transfer` are not read; `datatransfer.proto` has `DataTransferEncryptorMessageProto` and
+  `ClientNamenodeProtocol.proto` `getDataEncryptionKey`, but nothing uses them. RemoteBlockReader / Pipeline speak plain
+  DataTransferProtocol, so a DataNode that requires SASL (non-privileged port + protection) refuses the read.
+- NameNode RPC SASL is there with all three QOPs (authentication / integrity / privacy): commit cb9a82a (2016, "support secure rpc
+  transfer, including all three modes").
+- An implementation exists in the bdrosen96/libhdfs3 fork (the one Dask's hdfs3 used), 2016-10..2017-09: commits 286bff3
+  "partially working encryption", 03cc884, d913c95 "Don't reuse socket when we do SASL for data transfer", 12b6721 non-SASL fallback,
+  64338e9/49b06fa AES, 92522e7 "Partially plumb through encryption keys", PRs #18/#19 "fix_privacy". It reads both settings
+  (SessionConfig) and does the DIGEST-MD5 handshake on the block token in RemoteBlockReader and Pipeline, with QOP auth-conf wrap
+  and AES. Size: `git diff --stat 286bff3^ 1178d61 -- src` = 43 files, +1871/-233 (SaslClient.cpp +711 alone). Its base is the
+  2016 Pivotal code, so a port onto ClickHouse's tree is a rewrite of the hunks in RemoteBlockReader/Pipeline/SaslClient, not a
+  cherry-pick; `encrypt.data.transfer` with DataEncryptionKey was only "partially plumbed" there.
+- Estimate: libhdfs3 patch ~1000-1500 lines (SASL handshake + wrap/unwrap on the block reader stream; read path only - we do not
+  need the write Pipeline), plus a CI cluster with Kerberos (KDC container) and `dfs.data.transfer.protection=privacy`. Several
+  sessions. Not started - waiting for the maintainer's decision.
+
+Open follow-ups (not asked yet, for the maintainer):
+- the glob `read_parquet('.../*.parquet')` still costs one `getListing` per query (20 in 20 queries); the metadata cache does
+  not cache listings. A listing cache with the same TTL would make a repeated point query NameNode-free.
+- (b) was done as "open lazily from the cached block locations" (no NameNode call per re-open), not as one stream shared by all
+  DuckDB handles of a file: every re-open still sets up its own DataNode block reader.
+- ClickHouse/libhdfs3 master has new commits since our pin: c5dc2bd "Add HDFS slow DataNode avoidance", d9c26dc "Validate
+  malformed responses from Datanode and Namenode", 952ee51. Worth a look for a pin bump (would overlap our libhdfs3 0001).
+
+
 > **Maintainer, 2026-11-09 18:20 - ITEM P1 (first): cut the NameNode round trips per query (server item 39 (c), Q9).**
 > Measured by the server's HDFS point-query cell: every point query opens every Parquet file of its table about 5 times
 > (once per row group scanned + footer + bind), and every open comes with a `getfileinfo` (the stat before open) and
@@ -39,6 +70,12 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
   builds in `quay.io/pypa/manylinux_2_28_<arch>` (AlmaLinux 8, gcc-toolset-14, glibc 2.28), uploads
   `hadoopfs.duckdb_extension` + `.sha256` as artifact `hadoopfs-<version>-linux_<arch>`.
 
+- `tests/hadoopfs/` + `scripts/test-hadoopfs.sh` — unit test of the metadata cache (patch 0006, no HDFS; CI step)
+- `.github/workflows/hdfs-test.yml` + `tests/hdfs/` — runs a build's extension against a single-node HDFS 3.4.1 (containers) and
+  counts NameNode RPCs (JMX NameNodeActivity, read after the 10 s metrics cache) per repeated point query, cache off vs on;
+  checks results and mtime (`-f build_run_id=<id> -f duckdb_version=v1.5.6`)
+- `.github/workflows/release.yml` — attaches a build run's extension + `.sha256` to a release (`-f build_run_id -f tag`)
+
 Runtime needs (dynamically linked, from the OS): libxml2, MIT krb5 (gssapi_krb5/krb5/k5crypto/com_err), libuuid,
 OpenSSL. Everything else (libhdfs3, protobuf, gsasl, DuckDB, libstdc++) is inside the extension, symbols hidden.
 
@@ -50,7 +87,9 @@ OpenSSL. Everything else (libhdfs3, protobuf, gsasl, DuckDB, libstdc++) is insid
 | 0003 timeouts | settings `hdfs_connect_timeout_ms`, `hdfs_read_timeout_ms` (BIGINT ms; env `HDFS_CONNECT_TIMEOUT_MS` / `HDFS_READ_TIMEOUT_MS`). Precedence: setting > LIBHDFS3_CONF (`input.connect.timeout`, `input.read.timeout`) > default 5000 / 15000 ms (libhdfs3 defaults 600 s / 3600 s). Applied when a namenode connection is first created. |
 | 0004 retry rounds, message | `input.read.max.retry` default 3 (libhdfs3 default 60: with every replica of a block hung a read failed only after 60 x (replicas x read timeout + 1 s), measured 428 s with 2 replicas @ 3 s); LIBHDFS3_CONF still wins. Read error message shows the real offset (was `-1`). |
 | 0005 dead-node TTL | setting `hdfs_dead_node_ttl_ms` (BIGINT ms, env `HDFS_DEAD_NODE_TTL_MS`) -> libhdfs3 `input.deadnode.ttl` (needs libhdfs3 0001). Precedence: setting (>= 0, 0 = off) > LIBHDFS3_CONF > default 60000. |
+| 0006 metadata cache, lazy open, mtime | setting `hdfs_metadata_cache_ttl_ms` (BIGINT ms, env `HDFS_METADATA_CACHE_TTL_MS`, default 0 = off): file status and the located blocks of finalized files cached per namenode+path for that long, 10 000 paths LRU, process-wide; only successful lookups stored; a fresh status with another length/mtime drops the blocks; writes/deletes/renames/truncates invalidate. With the cache on, a read-only file is opened lazily (first read/seek) from the cached locations (libhdfs3 0002): a repeated open costs no NameNode call. `GetLastModifiedTime` fixed (upstream returned seconds*1000 microseconds = January 1970). Unit test `tests/hadoopfs/metadata_cache_test.cpp` (TSan). |
 | libhdfs3 0001 dead-node list | `DeadNodes`: process-wide list keyed by DataNode UUID@ip:xferPort. A node whose remote block reader fails (setup timeout/IO error, or read error mid-block) is avoided by all streams for `input.deadnode.ttl` ms (libhdfs3 default with the patch 60000, 0 = upstream behaviour); `choseBestNode` prefers replicas not on the list, a listed one is still tried when it is the only replica left; a successful block reader setup removes the node. EC (striped) reads unchanged. |
+| libhdfs3 0002 open from block locations | C API `hdfsGetBlockLocationsForRead` / `hdfsOpenFileWithBlockLocations` / `hdfsFreeBlockLocations`: open a read stream from pre-fetched located blocks without the `getBlockLocations` RPC (the stream still fetches further blocks and refreshes after failures). |
 
 libhdfs3 replica failover on a DataNode read timeout: in ceb428c (used by the v1.4.1 build) a timeout while setting up the
 block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost DataNode) was not caught as an
@@ -62,7 +101,8 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
 |---|---|---|---|---|---|---|
 | 2026-10-20 | 39412215060 | v1.4.5 | amd64 | OK, patches 0001-0003 (`51b7220-afc1`) | 33m25s (deps 6m42s cold, ext 24m45s cold ccache) | 5e98988006240663d8a189e45c6f6d95fc6418724bb4149170d4fc4c52eb0234 |
 | 2026-10-22 | 39692669742 | v1.4.5 | amd64 | OK, patches 0001-0004 (`51b7220-afc2`) | 2m51s (deps cache hit, ext 64 s, ccache 396/401 hits) | e3c8b077d5041a820e0495cd04fce77a8acf86bd3144d000ccb07fef495d1bce |
-| 2026-10-23 | 39952752512 | v1.4.5 | amd64 | OK, patches 0001-0005 + libhdfs3 0001 (`51b7220-afc3`) — **current** | 10m14s (unit tests 4 s, deps rebuild 6m51s, ext 88 s) | 044b5162efed99cb2df395ec2344b80fa5dc07c2a009525b814be9ba32cadecb |
+| 2026-10-23 | 39952752512 | v1.4.5 | amd64 | OK, patches 0001-0005 + libhdfs3 0001 (`51b7220-afc3`) | 10m14s (unit tests 4 s, deps rebuild 6m51s, ext 88 s) | 044b5162efed99cb2df395ec2344b80fa5dc07c2a009525b814be9ba32cadecb |
+| 2026-11-09 | 42643919332 | v1.5.6 | amd64 | OK, patches 0001-0006 + libhdfs3 0001-0002 (`51b7220-afc4`) — **current**, release `hadoopfs-51b7220-afc4-duckdb-v1.5.6`; HDFS test 42678080745 OK | 16m41s (deps rebuild 4m05s, ext 10m37s, ccache 79/324 hits: first v1.5.6 build) | 64a97a6b08e1f725c980d46f25d664a1c3edde8a73b624ac31bdc75f9095942c |
 
 ## Verification (local, DuckDB JDBC 1.4.5 in an AlmaLinux 8 container)
 - `afc1`: loads (file must be named `hadoopfs.duckdb_extension`: DuckDB derives the init symbol from the file name);
@@ -78,6 +118,10 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
   12.2 s with SET 3 s), v1.4.1 build -> `TProtocolException: Invalid data` after 3.1 s (another short-read symptom).
 
 ## Open
+- 2026-11-09: afc4 (patch 0006 + libhdfs3 0002) built for DuckDB v1.5.6 (run 42643919332). HDFS test 42678080745 (after two
+  fixes to the test itself: DataNode wait via JMX, JMX metrics cache): 20 point queries over 4 files (4 row groups each), cache off:
+  364 getfileinfo + 364 getBlockLocations (36 per query); cache on (600 s): 4 + 4 in total (first query only); results identical,
+  full scan identical, `last_modified` correct. Released `hadoopfs-51b7220-afc4-duckdb-v1.5.6`. P2 research written under Next steps.
 - HDFS machine-loss test on the bench DONE 2026-10-23 (afc-offline bench/tools/agent-hadoopfs/hk.sh, srv.sh; 3 DataNodes,
   replication 2, SF10, one DataNode silently disconnected for 90 s): afc2 0 failures, correct results (direct DuckDB 234
   queries; int6b server 63 queries); v1.4.1 build: `Snappy decompression failure` 16 s after the loss. During the outage
