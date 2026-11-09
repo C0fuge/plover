@@ -1,0 +1,507 @@
+From 0d21928e6da125d5e4836405b28687b83a60a089 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:19:42 +0000
+Subject: [PATCH] hadoopfs: process-wide metadata cache
+ (hdfs_metadata_cache_ttl_ms), lazy open, correct mtime
+
+DuckDB opens a Parquet file several times per query (bind, footer, one
+handle per scan state) and every open cost two NameNode calls
+(getfileinfo + getBlockLocations); FileExists one more. On a Kerberos/SASL
+cluster that is tens of round trips per point query.
+
+- setting hdfs_metadata_cache_ttl_ms (BIGINT ms, env
+  HDFS_METADATA_CACHE_TTL_MS, default 0 = off): file status and the
+  located blocks of finalized files are cached per namenode+path for that
+  long, 10000 paths LRU, process-wide; only successful lookups are stored;
+  a fresh status with another length/mtime drops the blocks; writes,
+  deletes, renames and truncates invalidate
+- with the cache on, a read-only regular file is opened lazily (first
+  read/seek) from the cached block locations (libhdfs3 patch 0002
+  hdfsOpenFileWithBlockLocations): a repeated open costs no NameNode call;
+  the locations cover the whole file, so the footer seek needs none either
+- GetLastModifiedTime: mLastMod is in seconds and timestamp_t in
+  microseconds; upstream returned seconds*1000 (January 1970)
+---
+ src/hadoopfs.cpp                        | 144 +++++++++++++++++++-
+ src/include/hadoopfs.hpp                |  21 +++
+ src/include/hadoopfs_metadata_cache.hpp | 171 ++++++++++++++++++++++++
+ 3 files changed, 333 insertions(+), 3 deletions(-)
+ create mode 100644 src/include/hadoopfs_metadata_cache.hpp
+
+diff --git a/src/hadoopfs.cpp b/src/hadoopfs.cpp
+index c333f3b..a57fdd2 100644
+--- a/src/hadoopfs.cpp
++++ b/src/hadoopfs.cpp
+@@ -475,6 +475,11 @@ namespace duckdb
+                                   "first); 0 = off (NULL: LIBHDFS3_CONF input.deadnode.ttl, else 60000)",
+                                   LogicalType::BIGINT, Value());
+ 
++        config.AddExtensionOption(HDFSParams::HDFS_METADATA_CACHE_TTL_MS,
++                                  "HDFS: ms a file's status and block locations are reused across opens (process-wide, "
++                                  "10000 files LRU; a changed length/mtime drops them); 0 = off",
++                                  LogicalType::BIGINT, Value::BIGINT(0));
++
+         auto provider = duckdb::make_uniq<HDFSEnvironmentSettingsProvider>(config);
+         provider->SetAll();
+ 
+@@ -620,8 +625,28 @@ namespace duckdb
+         auto hadoop_file_handle =
+             duckdb::make_uniq<HadoopFileHandle>(*this, path, flags, fs);
+         int hdfs_flag = 0;
+-        hdfsFileInfo *file_info = hdfsGetPathInfo(hadoop_file_handle->hdfs, path_out.c_str());
+-        if (!file_info)
++        bool read_only = flags.OpenForReading() && !flags.OpenForWriting() && !flags.OpenForAppending();
++        auto &cache = hadoopfs::MetadataCache::Instance();
++        auto cache_key = GetCacheKey(path);
++        int64_t ttl_ms = read_only ? GetMetadataCacheTtl(opener) : 0;
++        if (!read_only)
++        {
++            cache.Invalidate(cache_key);
++        }
++        hadoopfs::CachedFileStatus status;
++        hdfsFileInfo *file_info = nullptr;
++        bool cached = ttl_ms > 0 && cache.GetStatus(cache_key, ttl_ms, status);
++        if (!cached)
++        {
++            file_info = hdfsGetPathInfo(hadoop_file_handle->hdfs, path_out.c_str());
++        }
++        if (cached)
++        {
++            hadoop_file_handle->file_type = status.is_dir ? FileType::FILE_TYPE_DIR : FileType::FILE_TYPE_REGULAR;
++            hadoop_file_handle->length = status.length;
++            hadoop_file_handle->last_modified = Timestamp::FromEpochMs(status.mtime_ms);
++        }
++        else if (!file_info)
+         {
+             if (hadoop_file_handle->flags.OpenForWriting())
+             {
+@@ -663,8 +688,30 @@ namespace duckdb
+                 hadoop_file_handle->file_type = FileType::FILE_TYPE_INVALID;
+             }
+             hadoop_file_handle->length = file_info->mSize;
+-            hadoop_file_handle->last_modified = file_info->mLastMod * 1000; // convert to milliseconds
++            // mLastMod is in seconds (libhdfs3 drops the namenode's ms); timestamp_t is in microseconds. Upstream
++            // stored seconds * 1000 here (dates in January 1970), which DuckDB's Parquet metadata cache and external
++            // file cache compare to detect a changed file.
++            status.is_dir = file_info->mKind == kObjectKindDirectory;
++            status.length = file_info->mSize;
++            status.mtime_ms = static_cast<int64_t>(file_info->mLastMod) * 1000;
++            hadoop_file_handle->last_modified = Timestamp::FromEpochMs(status.mtime_ms);
++            bool cacheable = file_info->mKind == kObjectKindFile || file_info->mKind == kObjectKindDirectory;
+             hdfsFreeFileInfo(file_info, 1);
++            if (ttl_ms > 0 && cacheable)
++            {
++                cache.PutStatus(cache_key, status);
++            }
++        }
++
++        if (ttl_ms > 0 && hadoop_file_handle->file_type == FileType::FILE_TYPE_REGULAR)
++        {
++            // no NameNode call until the first read / seek; then from cached block locations
++            hadoop_file_handle->cache_key = cache_key;
++            hadoop_file_handle->cache_ttl_ms = ttl_ms;
++            hadoop_file_handle->hdfs_path = path_out;
++            hadoop_file_handle->status = status;
++            hadoop_file_handle->lazy_open = true;
++            return hadoop_file_handle;
+         }
+ 
+         if (flags.OpenForReading()) {
+@@ -686,6 +733,84 @@ namespace duckdb
+         return hadoop_file_handle;
+     }
+ 
++    void HadoopFileSystem::EnsureOpen(HadoopFileHandle &hfh)
++    {
++        if (hfh.hdfs_file || !hfh.lazy_open)
++        {
++            return;
++        }
++        auto &cache = hadoopfs::MetadataCache::Instance();
++        auto blocks = cache.GetBlocks(hfh.cache_key, hfh.cache_ttl_ms, hfh.status);
++        if (!blocks)
++        {
++            tOffset file_length = 0;
++            int complete = 0;
++            // all blocks of the file in one call (the stream would otherwise fetch the ones past the first
++            // dfs.prefetchsize blocks, e.g. for the Parquet footer, with another NameNode call)
++            auto locations = hdfsGetBlockLocationsForRead(hfh.hdfs, hfh.hdfs_path.c_str(),
++                                                          MaxValue<int64_t>(hfh.status.length, 1), &file_length,
++                                                          &complete);
++            if (!locations)
++            {
++                const char *error = hdfsGetLastError();
++                throw IOException("Failed to open file \"%s\": %s", hfh.GetPath(), error ? error : "unknown error");
++            }
++            blocks = std::shared_ptr<void>(locations, [](void *l) { hdfsFreeBlockLocations(static_cast<hdfsBlockLocations>(l)); });
++            // only finalized files whose length matches the status: anything else is being written
++            if (complete && file_length == hfh.status.length)
++            {
++                cache.PutBlocks(hfh.cache_key, hfh.status, blocks);
++            }
++        }
++        hfh.hdfs_file = hdfsOpenFileWithBlockLocations(hfh.hdfs, hfh.hdfs_path.c_str(),
++                                                       static_cast<hdfsBlockLocations>(blocks.get()));
++        if (!hfh.hdfs_file)
++        {
++            const char *error = hdfsGetLastError();
++            cache.Invalidate(hfh.cache_key);
++            throw IOException("Failed to open file \"%s\": %s", hfh.GetPath(), error ? error : "unknown error");
++        }
++    }
++
++    int64_t HadoopFileSystem::GetMetadataCacheTtl(optional_ptr<FileOpener> opener)
++    {
++        Value value;
++        bool found = false;
++        if (opener)
++        {
++            found = FileOpener::TryGetCurrentSetting(opener, HDFSParams::HDFS_METADATA_CACHE_TTL_MS, value);
++        }
++        if (!found)
++        {
++            found = instance.TryGetCurrentSetting(HDFSParams::HDFS_METADATA_CACHE_TTL_MS, value);
++        }
++        if (!found || value.IsNull())
++        {
++            return 0;
++        }
++        try
++        {
++            return value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
++        }
++        catch (...)
++        {
++            return 0;
++        }
++    }
++
++    string HadoopFileSystem::GetCacheKey(const string &url)
++    {
++        string url_path;
++        HDFSParams url_params;
++        HadoopFileSystem::ParseUrl(url, url_path, url_params);
++        string namenode = url_params.namenode;
++        if (namenode == "default")
++        {
++            namenode = HDFSParams::ReadFrom(instance).namenode;
++        }
++        return namenode + url_path;
++    }
++
+     FileType HadoopFileSystem::GetFileType(FileHandle &handle)
+     {
+         auto &hfh = (HadoopFileHandle &)handle;
+@@ -731,6 +856,7 @@ namespace duckdb
+         }
+         // hdfsRead takes a 32-bit length
+         auto chunk = static_cast<tSize>(MinValue<int64_t>(nr_bytes, NumericLimits<int32_t>::Maximum()));
++        EnsureOpen(hfh);
+         // position before the read: after a failed read hdfsTell() returns -1
+         auto position = hdfsTell(hfh.hdfs, hfh.hdfs_file);
+         auto length = hdfsRead(hfh.hdfs, hfh.hdfs_file, buffer, chunk);
+@@ -819,6 +945,12 @@ namespace duckdb
+     {
+         try
+         {
++            auto ttl_ms = GetMetadataCacheTtl(opener);
++            hadoopfs::CachedFileStatus status;
++            if (ttl_ms > 0 && hadoopfs::MetadataCache::Instance().GetStatus(GetCacheKey(filename), ttl_ms, status))
++            {
++                return true;
++            }
+             auto hdfs = GetHadoopFileSystem(filename, opener);
+             if (hdfsExists(hdfs, filename.c_str()) == 0)
+             {
+@@ -840,6 +972,7 @@ namespace duckdb
+     void HadoopFileSystem::Seek(FileHandle &handle, idx_t location)
+     {
+         auto &hfh = (HadoopFileHandle &)handle;
++        EnsureOpen(hfh);
+         auto position = SeekPosition(handle);
+         int64_t offset = location - position;
+         if (DUCKDB_UNLIKELY(offset != 0))
+@@ -854,12 +987,14 @@ namespace duckdb
+     idx_t HadoopFileSystem::SeekPosition(FileHandle &handle)
+     {
+         auto &hfh = (HadoopFileHandle &)handle;
++        EnsureOpen(hfh);
+         return hdfsTell(hfh.hdfs, hfh.hdfs_file);
+     }
+ 
+     void HadoopFileSystem::Truncate(FileHandle &handle, int64_t new_size)
+     {
+         auto &hfh = (HadoopFileHandle &)handle;
++        hadoopfs::MetadataCache::Instance().Invalidate(GetCacheKey(hfh.path));
+         int should_wait;
+         auto result = hdfsTruncate(hfh.hdfs, hfh.path.c_str(), new_size, &should_wait);
+     }
+@@ -878,18 +1013,21 @@ namespace duckdb
+     void HadoopFileSystem::RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener)
+     {
+         auto hdfs = GetHadoopFileSystem(directory, opener);
++        hadoopfs::MetadataCache::Instance().Clear();
+         hdfsDelete(hdfs, directory.c_str(), 1);
+     }
+ 
+     void HadoopFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener)
+     {
+         auto hdfs = GetHadoopFileSystem(source, opener);
++        hadoopfs::MetadataCache::Instance().Clear();
+         hdfsRename(hdfs, source.c_str(), target.c_str());
+     }
+ 
+     void HadoopFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener)
+     {
+         auto hdfs = GetHadoopFileSystem(filename, opener);
++        hadoopfs::MetadataCache::Instance().Invalidate(GetCacheKey(filename));
+         hdfsDelete(hdfs, filename.c_str(), 1);
+     }
+ 
+diff --git a/src/include/hadoopfs.hpp b/src/include/hadoopfs.hpp
+index 0eaac26..0ca2d4b 100644
+--- a/src/include/hadoopfs.hpp
++++ b/src/include/hadoopfs.hpp
+@@ -8,6 +8,8 @@
+ 
+ #include <hdfs/hdfs.h>
+ 
++#include "hadoopfs_metadata_cache.hpp"
++
+ namespace duckdb
+ {
+ 
+@@ -20,6 +22,7 @@ namespace duckdb
+         static constexpr const char *HDFS_CONNECT_TIMEOUT_MS = "hdfs_connect_timeout_ms";
+         static constexpr const char *HDFS_READ_TIMEOUT_MS = "hdfs_read_timeout_ms";
+         static constexpr const char *HDFS_DEAD_NODE_TTL_MS = "hdfs_dead_node_ttl_ms";
++        static constexpr const char *HDFS_METADATA_CACHE_TTL_MS = "hdfs_metadata_cache_ttl_ms";
+         //! used when neither the DuckDB setting nor LIBHDFS3_CONF sets a value (libhdfs3's own defaults are 600 s / 3600 s,
+         //! which turn a silently lost DataNode into a hang instead of a failover to the next replica)
+         static constexpr int64_t DEFAULT_CONNECT_TIMEOUT_MS = 5000;
+@@ -121,6 +124,7 @@ namespace duckdb
+         static constexpr const char *HDFS_CONNECT_TIMEOUT_MS = "HDFS_CONNECT_TIMEOUT_MS";
+         static constexpr const char *HDFS_READ_TIMEOUT_MS = "HDFS_READ_TIMEOUT_MS";
+         static constexpr const char *HDFS_DEAD_NODE_TTL_MS = "HDFS_DEAD_NODE_TTL_MS";
++        static constexpr const char *HDFS_METADATA_CACHE_TTL_MS = "HDFS_METADATA_CACHE_TTL_MS";
+ 
+         explicit HDFSEnvironmentSettingsProvider(DBConfig &config) : config(config){};
+ 
+@@ -155,6 +159,7 @@ namespace duckdb
+             this->SetExtensionOptionValue(HDFSParams::HDFS_CONNECT_TIMEOUT_MS, this->HDFS_CONNECT_TIMEOUT_MS);
+             this->SetExtensionOptionValue(HDFSParams::HDFS_READ_TIMEOUT_MS, this->HDFS_READ_TIMEOUT_MS);
+             this->SetExtensionOptionValue(HDFSParams::HDFS_DEAD_NODE_TTL_MS, this->HDFS_DEAD_NODE_TTL_MS);
++            this->SetExtensionOptionValue(HDFSParams::HDFS_METADATA_CACHE_TTL_MS, this->HDFS_METADATA_CACHE_TTL_MS);
+         }
+     };
+ 
+@@ -178,6 +183,13 @@ namespace duckdb
+         //! serialises seek + read on the libhdfs3 stream
+         mutex io_lock;
+         timestamp_t last_modified{};
++        //! metadata cache (hdfs_metadata_cache_ttl_ms > 0): key, ttl at open, HDFS path and the file's status.
++        //! A read-only regular file is then opened lazily (first read / seek) from cached block locations.
++        string cache_key;
++        int64_t cache_ttl_ms = 0;
++        string hdfs_path;
++        hadoopfs::CachedFileStatus status;
++        bool lazy_open = false;
+ 
+     public:
+         void Close() override;
+@@ -222,6 +234,15 @@ namespace duckdb
+ 
+         int64_t ReadFromHDFS(FileHandle &handle, void *buffer, int64_t nr_bytes);
+ 
++        //! opens the libhdfs3 stream of a lazily opened handle (caller holds io_lock or owns the handle)
++        void EnsureOpen(HadoopFileHandle &hfh);
++
++        //! hdfs_metadata_cache_ttl_ms (session setting, else global); <= 0 = cache off
++        int64_t GetMetadataCacheTtl(optional_ptr<FileOpener> opener);
++
++        //! process-wide cache key: namenode (as the connection map names it) + HDFS path
++        string GetCacheKey(const string &url);
++
+         void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
+ 
+         int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+diff --git a/src/include/hadoopfs_metadata_cache.hpp b/src/include/hadoopfs_metadata_cache.hpp
+new file mode 100644
+index 0000000..437b466
+--- /dev/null
++++ b/src/include/hadoopfs_metadata_cache.hpp
+@@ -0,0 +1,171 @@
++#pragma once
++// Process-wide cache of HDFS file metadata (status and located blocks) per path. Plain C++ (no DuckDB / libhdfs3
++// headers) so it can be unit tested without HDFS. Every NameNode round trip saved here matters on Kerberos/SASL
++// clusters: DuckDB opens a Parquet file several times per query (bind, footer, one handle per scan state).
++//
++// Rules: entries live ttl_ms after they were fetched (ttl is passed per call: it is a DuckDB setting); only successful
++// lookups are stored (never errors or "not found"); a fresh status with another length or mtime drops the cached
++// blocks; at most `capacity` paths (least recently used evicted).
++
++#include <chrono>
++#include <cstdint>
++#include <functional>
++#include <list>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++namespace hadoopfs {
++
++struct CachedFileStatus {
++	bool is_dir = false;
++	int64_t length = 0;
++	int64_t mtime_ms = 0;
++	bool SameVersion(const CachedFileStatus &o) const {
++		return is_dir == o.is_dir && length == o.length && mtime_ms == o.mtime_ms;
++	}
++};
++
++class MetadataCache {
++public:
++	using Clock = std::function<int64_t()>; // monotonic ms
++	static int64_t SteadyMs() {
++		return std::chrono::duration_cast<std::chrono::milliseconds>(
++		           std::chrono::steady_clock::now().time_since_epoch())
++		    .count();
++	}
++
++	explicit MetadataCache(size_t capacity = 10000, Clock clock = SteadyMs)
++	    : capacity(capacity ? capacity : 1), clock(std::move(clock)) {
++	}
++
++	static MetadataCache &Instance() {
++		static MetadataCache cache;
++		return cache;
++	}
++
++	//! status of key if fetched less than ttl_ms ago
++	bool GetStatus(const std::string &key, int64_t ttl_ms, CachedFileStatus &out) {
++		if (ttl_ms <= 0) {
++			return false;
++		}
++		std::lock_guard<std::mutex> guard(lock);
++		auto entry = Find(key);
++		if (!entry || !entry->has_status || clock() - entry->status_time >= ttl_ms) {
++			status_misses++;
++			return false;
++		}
++		status_hits++;
++		out = entry->status;
++		return true;
++	}
++
++	//! a freshly fetched status; drops cached blocks of an older version of the file
++	void PutStatus(const std::string &key, const CachedFileStatus &status) {
++		std::lock_guard<std::mutex> guard(lock);
++		auto &entry = FindOrInsert(key);
++		if (entry.has_status && !entry.status.SameVersion(status)) {
++			entry.blocks.reset();
++		}
++		if (entry.blocks && !entry.blocks_status.SameVersion(status)) {
++			entry.blocks.reset();
++		}
++		entry.status = status;
++		entry.has_status = true;
++		entry.status_time = clock();
++	}
++
++	//! blocks fetched less than ttl_ms ago for exactly this version of the file (else null)
++	std::shared_ptr<void> GetBlocks(const std::string &key, int64_t ttl_ms, const CachedFileStatus &status) {
++		if (ttl_ms <= 0) {
++			return nullptr;
++		}
++		std::lock_guard<std::mutex> guard(lock);
++		auto entry = Find(key);
++		if (!entry || !entry->blocks || !entry->blocks_status.SameVersion(status) ||
++		    clock() - entry->blocks_time >= ttl_ms) {
++			block_misses++;
++			return nullptr;
++		}
++		block_hits++;
++		return entry->blocks;
++	}
++
++	//! blocks of the file version `status` (the caller only stores locations of finalized files)
++	void PutBlocks(const std::string &key, const CachedFileStatus &status, std::shared_ptr<void> blocks) {
++		std::lock_guard<std::mutex> guard(lock);
++		auto &entry = FindOrInsert(key);
++		if (entry.has_status && !entry.status.SameVersion(status)) {
++			return; // a newer status arrived meanwhile
++		}
++		entry.blocks = std::move(blocks);
++		entry.blocks_status = status;
++		entry.blocks_time = clock();
++	}
++
++	void Invalidate(const std::string &key) {
++		std::lock_guard<std::mutex> guard(lock);
++		auto it = map.find(key);
++		if (it != map.end()) {
++			lru.erase(it->second);
++			map.erase(it);
++		}
++	}
++
++	void Clear() {
++		std::lock_guard<std::mutex> guard(lock);
++		map.clear();
++		lru.clear();
++	}
++
++	size_t Size() {
++		std::lock_guard<std::mutex> guard(lock);
++		return map.size();
++	}
++
++	uint64_t status_hits = 0, status_misses = 0, block_hits = 0, block_misses = 0;
++
++private:
++	struct Entry {
++		std::string key;
++		bool has_status = false;
++		CachedFileStatus status;
++		int64_t status_time = 0;
++		std::shared_ptr<void> blocks;
++		CachedFileStatus blocks_status;
++		int64_t blocks_time = 0;
++	};
++	using List = std::list<Entry>;
++
++	Entry *Find(const std::string &key) {
++		auto it = map.find(key);
++		if (it == map.end()) {
++			return nullptr;
++		}
++		lru.splice(lru.begin(), lru, it->second);
++		return &*it->second;
++	}
++
++	Entry &FindOrInsert(const std::string &key) {
++		if (auto entry = Find(key)) {
++			return *entry;
++		}
++		lru.emplace_front();
++		lru.front().key = key;
++		map[key] = lru.begin();
++		while (map.size() > capacity) {
++			map.erase(lru.back().key);
++			lru.pop_back();
++		}
++		return lru.front();
++	}
++
++	size_t capacity;
++	Clock clock;
++	std::mutex lock;
++	List lru;
++	std::unordered_map<std::string, List::iterator> map;
++};
++
++} // namespace hadoopfs
+-- 
+2.43.0
+

@@ -1,0 +1,152 @@
+From 99800fb23e53cb4637f94cd9449db5b00d7f9bcd Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 15:16:17 +0000
+Subject: [PATCH] Open read streams from pre-fetched block locations (no
+ namenode round trip)
+
+hdfsOpenFile(O_RDONLY) always calls getBlockLocations on the namenode. A
+caller that opens the same immutable file many times (DuckDB opens a
+Parquet file once per scan state / row group, plus footer and bind) pays
+one namenode round trip per open, which dominates point queries on a
+Kerberos/SASL cluster.
+
+New C API:
+- hdfsGetBlockLocationsForRead(fs, path, &length, &complete): the
+  getBlockLocations call of hdfsOpenFile, returned as an opaque handle
+- hdfsOpenFileWithBlockLocations(fs, path, locations): open for read from
+  a private copy of the locations, no namenode RPC (the stream still
+  fetches further blocks and refreshes after failures as usual)
+- hdfsFreeBlockLocations(locations)
+
+The caller decides how long locations stay valid.
+---
+ src/client/Hdfs.cpp | 70 +++++++++++++++++++++++++++++++++++++++++++++
+ src/client/hdfs.h   | 31 ++++++++++++++++++++
+ 2 files changed, 101 insertions(+)
+
+diff --git a/src/client/Hdfs.cpp b/src/client/Hdfs.cpp
+index 672a986..08d20af 100644
+--- a/src/client/Hdfs.cpp
++++ b/src/client/Hdfs.cpp
+@@ -741,6 +741,76 @@ hdfsFile hdfsOpenFile(hdfsFS fs, const char * path, int flags, int bufferSize,
+     return NULL;
+ }
+ 
++struct HdfsBlockLocationsInternal {
++    shared_ptr<Hdfs::Internal::LocatedBlocksImpl> lbs;
++};
++
++hdfsBlockLocations hdfsGetBlockLocationsForRead(hdfsFS fs, const char * path, tOffset length,
++                                                tOffset * fileLength, int * lastBlockComplete) {
++    PARAMETER_ASSERT(fs && path && strlen(path) > 0, NULL, EINVAL);
++    HdfsBlockLocationsInternal * result = NULL;
++
++    try {
++        Hdfs::Internal::SessionConfig conf(fs->getFilesystem().getConf());
++        int64_t prefetchSize = length > 0 ? length : conf.getDefaultBlockSize() * conf.getPrefetchSize();
++        result = new HdfsBlockLocationsInternal;
++        result->lbs = shared_ptr<Hdfs::Internal::LocatedBlocksImpl>(new Hdfs::Internal::LocatedBlocksImpl);
++        std::string standardPath = fs->getFilesystem().getStandardPath(path);
++        fs->getFilesystem().getBlockLocations(standardPath, 0, prefetchSize, *result->lbs);
++        if (fileLength) {
++            *fileLength = result->lbs->getFileLength();
++        }
++        if (lastBlockComplete) {
++            *lastBlockComplete = result->lbs->isLastBlockComplete() ? 1 : 0;
++        }
++        return result;
++    } catch (const std::bad_alloc & e) {
++        delete result;
++        SetErrorMessage("Out of memory");
++        errno = ENOMEM;
++    } catch (...) {
++        delete result;
++        SetLastException(Hdfs::current_exception());
++        handleException(Hdfs::current_exception());
++    }
++
++    return NULL;
++}
++
++void hdfsFreeBlockLocations(hdfsBlockLocations locations) {
++    delete locations;
++}
++
++hdfsFile hdfsOpenFileWithBlockLocations(hdfsFS fs, const char * path, hdfsBlockLocations locations) {
++    PARAMETER_ASSERT(fs && path && strlen(path) > 0 && locations && locations->lbs, NULL, EINVAL);
++    HdfsFileInternalWrapper * file = NULL;
++    InputStream * is = NULL;
++
++    try {
++        file = new HdfsFileInternalWrapper();
++        // the stream extends / refreshes its blocks in place: give it its own copy
++        shared_ptr<Hdfs::Internal::LocatedBlocks> lbs =
++            shared_ptr<Hdfs::Internal::LocatedBlocksImpl>(new Hdfs::Internal::LocatedBlocksImpl(*locations->lbs));
++        file->setInput(true);
++        is = new InputStream(lbs);
++        is->open(fs->getFilesystem(), path, true);
++        file->setStream(is);
++        return file;
++    } catch (const std::bad_alloc & e) {
++        delete file;
++        delete is;
++        SetErrorMessage("Out of memory");
++        errno = ENOMEM;
++    } catch (...) {
++        delete file;
++        delete is;
++        SetLastException(Hdfs::current_exception());
++        handleException(Hdfs::current_exception());
++    }
++
++    return NULL;
++}
++
+ int hdfsCloseFile(hdfsFS fs, hdfsFile file) {
+     PARAMETER_ASSERT(fs, -1, EINVAL);
+ 
+diff --git a/src/client/hdfs.h b/src/client/hdfs.h
+index d03574e..e3d7441 100644
+--- a/src/client/hdfs.h
++++ b/src/client/hdfs.h
+@@ -319,6 +319,37 @@ int hdfsDisconnect(hdfsFS fs);
+ hdfsFile hdfsOpenFile(hdfsFS fs, const char * path, int flags, int bufferSize,
+                       short replication, tOffset blocksize);
+ 
++/**
++ * Located blocks of a file, fetched once and used to open read streams without a namenode round trip.
++ * (Patch: callers that open the same immutable file often, e.g. DuckDB reading Parquet row groups, cache these.)
++ */
++struct HdfsBlockLocationsInternal;
++typedef struct HdfsBlockLocationsInternal * hdfsBlockLocations;
++
++/**
++ * hdfsGetBlockLocationsForRead - the namenode getBlockLocations call of hdfsOpenFile(O_RDONLY), from offset 0.
++ * @param length bytes to cover; <= 0: dfs.default.blocksize x dfs.prefetchsize (what hdfsOpenFile fetches).
++ * @param fileLength if not NULL: the file length the namenode reported.
++ * @param lastBlockComplete if not NULL: 1 if the file is not being written (last block finalized), else 0.
++ * @return the locations (free with hdfsFreeBlockLocations) or NULL on error (errno, hdfsGetLastError()).
++ */
++hdfsBlockLocations hdfsGetBlockLocationsForRead(hdfsFS fs, const char * path, tOffset length,
++                                                tOffset * fileLength, int * lastBlockComplete);
++
++/**
++ * hdfsFreeBlockLocations - free locations from hdfsGetBlockLocationsForRead (NULL is ignored).
++ * Streams opened from them stay valid: each stream works on its own copy.
++ */
++void hdfsFreeBlockLocations(hdfsBlockLocations locations);
++
++/**
++ * hdfsOpenFileWithBlockLocations - open path for read like hdfsOpenFile(fs, path, O_RDONLY, 0, 0, 0), but start from
++ * a private copy of locations instead of asking the namenode. The stream still asks the namenode for blocks beyond
++ * the copy and refreshes locations after read failures, like any stream. Thread-safe: locations is only read.
++ * @return the file handle or NULL on error.
++ */
++hdfsFile hdfsOpenFileWithBlockLocations(hdfsFS fs, const char * path, hdfsBlockLocations locations);
++
+ /**
+  * hdfsCloseFile - Close an open file.
+  * @param fs The configured filesystem handle.
+-- 
+2.43.0
+

@@ -48,6 +48,9 @@ jobs:
       - name: unit tests (libhdfs3 patches)
         run: bash scripts/test-libhdfs3.sh
 
+      - name: unit tests (hadoopfs patches)
+        run: bash scripts/test-hadoopfs.sh
+
       - name: deps cache
         id: deps
         uses: actions/cache/restore@v4

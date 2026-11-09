@@ -1,0 +1,46 @@
+name: hdfs test (single-node HDFS)
+
+# Runs a build's extension against a single-node HDFS 3.4 (namenode + datanode containers, host network) and counts
+# NameNode RPCs (JMX NameNodeActivity) per repeated point query, metadata cache off vs on; checks results and mtime.
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: run id of a build.yml run (artifact hadoopfs-<duckdb_version>-linux_amd64)
+        required: true
+      duckdb_version:
+        description: DuckDB release the extension was built for
+        default: v1.5.6
+
+jobs:
+  hdfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: hadoopfs-${{ inputs.duckdb_version }}-linux_amd64
+          path: ext
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: start HDFS
+        run: bash tests/hdfs/start-hdfs.sh
+      - name: test data (4 Parquet files x 200000 rows, 4 row groups each)
+        run: |
+          curl -sSfL -o duckdb.zip "https://github.com/duckdb/duckdb/releases/download/${{ inputs.duckdb_version }}/duckdb_cli-linux-amd64.zip"
+          unzip -qo duckdb.zip && mkdir -p data
+          for i in 0 1 2 3; do
+            ./duckdb -c "COPY (SELECT range AS id, range % 97 AS v, md5(range::VARCHAR) AS s FROM range($((i * 200000)), $(((i + 1) * 200000))))
+              TO 'data/f$i.parquet' (FORMAT parquet, ROW_GROUP_SIZE 50000)"
+          done
+          ls -la data
+          docker exec nn hdfs dfs -mkdir -p /t && docker exec nn hdfs dfs -put -f /w/data/f0.parquet /w/data/f1.parquet /w/data/f2.parquet /w/data/f3.parquet /t/
+          docker exec nn hdfs dfs -ls /t
+      - name: test (AlmaLinux 8 container = the extension's runtime libs)
+        run: |
+          docker run --rm --network host -v "$PWD:/w" -w /w -e DUCKDB_VERSION=${{ inputs.duckdb_version }} \
+            almalinux:8 bash tests/hdfs/run.sh
+      - name: namenode log
+        if: failure()
+        run: docker logs nn 2>&1 | tail -100; docker logs dn 2>&1 | tail -50
