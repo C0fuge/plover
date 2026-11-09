@@ -94,8 +94,8 @@ int main() {
 		MetadataCache lc(100, [&] { return now; });
 		CHECK(!lc.GetListing("nn/t", 5000));
 		auto listing = std::make_shared<hadoopfs::CachedListing>();
-		listing->push_back({"hdfs://nn/t/f0.parquet", false});
-		listing->push_back({"hdfs://nn/t/sub", true});
+		listing->emplace_back("hdfs://nn/t/f0.parquet", false);
+		listing->emplace_back("hdfs://nn/t/sub", true);
 		lc.PutListing("nn/t/", listing);
 		lc.PutStatus("nn/t/f0.parquet", File(10, 1));
 		auto got = lc.GetListing("nn/t", 5000);

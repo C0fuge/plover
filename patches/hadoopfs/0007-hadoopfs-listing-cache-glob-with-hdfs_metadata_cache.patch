@@ -1,4 +1,4 @@
-From fe103bcff8e3ae7591ae104a96abf5d6debf20eb Mon Sep 17 00:00:00 2001
+From 66c69f432ab55d92514b922ff6613ffa5a84c9ef Mon Sep 17 00:00:00 2001
 From: C0fuge <189659128+C0fuge@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 21:07:37 +0000
 Subject: [PATCH] hadoopfs: listing cache (glob) with
@@ -16,12 +16,12 @@ getListing per query even with the metadata cache on.
   the listing of its parent directory; renames and directory deletes
   clear the whole cache as before
 ---
- src/hadoopfs.cpp                        | 44 ++++++++++++++--
- src/include/hadoopfs_metadata_cache.hpp | 69 +++++++++++++++++++++++--
- 2 files changed, 105 insertions(+), 8 deletions(-)
+ src/hadoopfs.cpp                        | 44 +++++++++++++--
+ src/include/hadoopfs_metadata_cache.hpp | 71 +++++++++++++++++++++++--
+ 2 files changed, 107 insertions(+), 8 deletions(-)
 
 diff --git a/src/hadoopfs.cpp b/src/hadoopfs.cpp
-index a57fdd2..f66a9de 100644
+index a57fdd2..af38463 100644
 --- a/src/hadoopfs.cpp
 +++ b/src/hadoopfs.cpp
 @@ -353,6 +353,23 @@ namespace duckdb
@@ -64,7 +64,7 @@ index a57fdd2..f66a9de 100644
 +            bool is_dir = file_info[i].mKind == kObjectKindDirectory;
 +            if (ttl_ms > 0)
 +            {
-+                listing->push_back({file_path, is_dir});
++                listing->emplace_back(file_path, is_dir);
 +                // the listing carries each child's status: the opens that follow the glob need no getfileinfo
 +                if (is_dir || file_info[i].mKind == kObjectKindFile)
 +                {
@@ -107,7 +107,7 @@ index a57fdd2..f66a9de 100644
      }
  
 diff --git a/src/include/hadoopfs_metadata_cache.hpp b/src/include/hadoopfs_metadata_cache.hpp
-index 437b466..df97cb4 100644
+index 437b466..9259d9b 100644
 --- a/src/include/hadoopfs_metadata_cache.hpp
 +++ b/src/include/hadoopfs_metadata_cache.hpp
 @@ -3,6 +3,9 @@
@@ -128,14 +128,16 @@ index 437b466..df97cb4 100644
  
  namespace hadoopfs {
  
-@@ -27,8 +31,30 @@ struct CachedFileStatus {
+@@ -27,8 +31,32 @@ struct CachedFileStatus {
  	}
  };
  
 +//! one child of a listed directory: the full URL as handed to DuckDB's ListFiles callback
 +struct CachedListEntry {
++	CachedListEntry(std::string path, bool is_dir) : path(std::move(path)), is_dir(is_dir) {
++	}
 +	std::string path;
-+	bool is_dir = false;
++	bool is_dir;
 +};
 +using CachedListing = std::vector<CachedListEntry>;
 +
@@ -159,7 +161,7 @@ index 437b466..df97cb4 100644
  	using Clock = std::function<int64_t()>; // monotonic ms
  	static int64_t SteadyMs() {
  		return std::chrono::duration_cast<std::chrono::milliseconds>(
-@@ -104,12 +130,42 @@ public:
+@@ -104,12 +132,42 @@ public:
  		entry.blocks_time = clock();
  	}
  
@@ -206,7 +208,7 @@ index 437b466..df97cb4 100644
  		}
  	}
  
-@@ -124,7 +180,8 @@ public:
+@@ -124,7 +182,8 @@ public:
  		return map.size();
  	}
  
@@ -216,7 +218,7 @@ index 437b466..df97cb4 100644
  
  private:
  	struct Entry {
-@@ -135,6 +192,8 @@ private:
+@@ -135,6 +194,8 @@ private:
  		std::shared_ptr<void> blocks;
  		CachedFileStatus blocks_status;
  		int64_t blocks_time = 0;
