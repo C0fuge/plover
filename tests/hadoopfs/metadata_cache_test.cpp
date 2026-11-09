@@ -1,4 +1,4 @@
-// Unit test of hadoopfs::MetadataCache (patch 0006), no HDFS: TTL, version change, LRU bound, errors not cached.
+// Unit test of hadoopfs::MetadataCache (patches 0006, 0007), no HDFS: TTL, version change, LRU bound, listings.
 #include "hadoopfs_metadata_cache.hpp"
 
 #include <cstdio>
@@ -87,6 +87,39 @@ int main() {
 	CHECK(!cache.GetStatus("nn/1", 5000, out));
 	cache.Invalidate("nn/none");
 
+	// listings (patch 0007): TTL, trailing '/', invalidation of a child drops the parent's listing only
+	CHECK(MetadataCache::DirKey("nn/t/") == "nn/t" && MetadataCache::DirKey("nn/t") == "nn/t");
+	CHECK(MetadataCache::ParentKey("nn/t/f0.parquet") == "nn/t" && MetadataCache::ParentKey("nn/t/sub/") == "nn/t");
+	{
+		MetadataCache lc(100, [&] { return now; });
+		CHECK(!lc.GetListing("nn/t", 5000));
+		auto listing = std::make_shared<hadoopfs::CachedListing>();
+		listing->push_back({"hdfs://nn/t/f0.parquet", false});
+		listing->push_back({"hdfs://nn/t/sub", true});
+		lc.PutListing("nn/t/", listing);
+		lc.PutStatus("nn/t/f0.parquet", File(10, 1));
+		auto got = lc.GetListing("nn/t", 5000);
+		CHECK(got && got->size() == 2 && (*got)[1].is_dir && (*got)[0].path == "hdfs://nn/t/f0.parquet");
+		CHECK(!lc.GetListing("nn/t", 0));
+		now += 5000;
+		CHECK(!lc.GetListing("nn/t", 5000)); // expired
+		lc.PutListing("nn/t", listing);
+		lc.PutStatus("nn/t/f0.parquet", File(10, 1));
+		lc.PutStatus("nn/t", File(0, 1)); // the directory's own status leaves its listing alone
+		CHECK(lc.GetListing("nn/t", 5000));
+		lc.Invalidate("nn/t/other.parquet"); // a new file in nn/t: listing gone, sibling status kept
+		CHECK(!lc.GetListing("nn/t", 5000));
+		CHECK(lc.GetStatus("nn/t/f0.parquet", 5000, out));
+		lc.PutListing("nn/t", listing);
+		lc.Invalidate("nn/u/x"); // another directory: untouched
+		CHECK(lc.GetListing("nn/t", 5000));
+		lc.Invalidate("nn/t/"); // the directory itself (CreateDirectory / delete)
+		CHECK(!lc.GetListing("nn/t", 5000));
+		lc.PutListing("nn/t", listing);
+		lc.Clear();
+		CHECK(!lc.GetListing("nn/t", 5000));
+	}
+
 	// concurrent use (run under -fsanitize=thread in CI if wanted)
 	MetadataCache shared(1000);
 	std::vector<std::thread> threads;
@@ -97,6 +130,12 @@ int main() {
 				auto key = "nn/f" + std::to_string((i * 7 + t) % 1500);
 				if (!shared.GetStatus(key, 60000, o)) {
 					shared.PutStatus(key, File(i % 3, 1));
+				}
+				if (!shared.GetListing("nn/d" + std::to_string(i % 50), 60000)) {
+					shared.PutListing("nn/d" + std::to_string(i % 50), std::make_shared<hadoopfs::CachedListing>());
+				}
+				if (i % 101 == 0) {
+					shared.Invalidate(key);
 				}
 				if (!shared.GetBlocks(key, 60000, File(i % 3, 1))) {
 					shared.PutBlocks(key, File(i % 3, 1), std::make_shared<int>(i));

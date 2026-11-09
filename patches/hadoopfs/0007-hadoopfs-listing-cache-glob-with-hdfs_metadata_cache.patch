@@ -1,0 +1,230 @@
+From fe103bcff8e3ae7591ae104a96abf5d6debf20eb Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 21:07:37 +0000
+Subject: [PATCH] hadoopfs: listing cache (glob) with
+ hdfs_metadata_cache_ttl_ms
+
+read_parquet('.../*.parquet') lists the directory on every query: one
+getListing per query even with the metadata cache on.
+
+- ListFiles: a successful listing is cached per namenode+directory for
+  hdfs_metadata_cache_ttl_ms (same cache, LRU and setting as patch 0006);
+  a cached listing replays the callback without a NameNode call
+- the listing carries each child's length/mtime: it primes the status
+  cache, so the opens that follow the first glob need no getfileinfo
+- invalidating a path (write/truncate/delete, CreateDirectory) also drops
+  the listing of its parent directory; renames and directory deletes
+  clear the whole cache as before
+---
+ src/hadoopfs.cpp                        | 44 ++++++++++++++--
+ src/include/hadoopfs_metadata_cache.hpp | 69 +++++++++++++++++++++++--
+ 2 files changed, 105 insertions(+), 8 deletions(-)
+
+diff --git a/src/hadoopfs.cpp b/src/hadoopfs.cpp
+index a57fdd2..f66a9de 100644
+--- a/src/hadoopfs.cpp
++++ b/src/hadoopfs.cpp
+@@ -353,6 +353,23 @@ namespace duckdb
+     {
+         string path_out, proto_host_port;
+         HadoopFileSystem::ParseUrl(directory, path_out, proto_host_port);
++        // listing cache (hdfs_metadata_cache_ttl_ms): the glob of a repeated read_parquet('.../*.parquet') costs no
++        // getListing; only successful listings are stored
++        auto &cache = hadoopfs::MetadataCache::Instance();
++        int64_t ttl_ms = GetMetadataCacheTtl(opener);
++        string dir_key;
++        if (ttl_ms > 0)
++        {
++            dir_key = GetCacheKey(directory);
++            if (auto listing = cache.GetListing(dir_key, ttl_ms))
++            {
++                for (auto &entry : *listing)
++                {
++                    callback(entry.path, entry.is_dir);
++                }
++                return true;
++            }
++        }
+         int num_entries;
+         auto hdfsFS = GetHadoopFileSystem(directory, opener);
+         hdfsFileInfo *file_info = hdfsListDirectory(hdfsFS, path_out.c_str(), &num_entries);
+@@ -360,6 +377,7 @@ namespace duckdb
+         {
+             return false;
+         }
++        auto listing = std::make_shared<hadoopfs::CachedListing>();
+ 
+         for (int i = 0; i < num_entries; ++i)
+         {
+@@ -373,10 +391,28 @@ namespace duckdb
+             {
+                 file_path += proto_host_port_with_separator + file_info[i].mName;
+             }
+-            callback(file_path, file_info[i].mKind == kObjectKindDirectory);
++            bool is_dir = file_info[i].mKind == kObjectKindDirectory;
++            if (ttl_ms > 0)
++            {
++                listing->push_back({file_path, is_dir});
++                // the listing carries each child's status: the opens that follow the glob need no getfileinfo
++                if (is_dir || file_info[i].mKind == kObjectKindFile)
++                {
++                    hadoopfs::CachedFileStatus status;
++                    status.is_dir = is_dir;
++                    status.length = file_info[i].mSize;
++                    status.mtime_ms = static_cast<int64_t>(file_info[i].mLastMod) * 1000;
++                    cache.PutStatus(GetCacheKey(file_path), status);
++                }
++            }
++            callback(file_path, is_dir);
+         }
+ 
+         hdfsFreeFileInfo(file_info, num_entries);
++        if (ttl_ms > 0)
++        {
++            cache.PutListing(dir_key, std::move(listing));
++        }
+ 
+         return true;
+     }
+@@ -476,8 +512,9 @@ namespace duckdb
+                                   LogicalType::BIGINT, Value());
+ 
+         config.AddExtensionOption(HDFSParams::HDFS_METADATA_CACHE_TTL_MS,
+-                                  "HDFS: ms a file's status and block locations are reused across opens (process-wide, "
+-                                  "10000 files LRU; a changed length/mtime drops them); 0 = off",
++                                  "HDFS: ms a file's status, block locations and directory listings are reused across "
++                                  "opens and globs (process-wide, 10000 paths LRU; a changed length/mtime drops the "
++                                  "blocks); 0 = off",
+                                   LogicalType::BIGINT, Value::BIGINT(0));
+ 
+         auto provider = duckdb::make_uniq<HDFSEnvironmentSettingsProvider>(config);
+@@ -1007,6 +1044,7 @@ namespace duckdb
+     void HadoopFileSystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener)
+     {
+         auto hdfs = GetHadoopFileSystem(directory, opener);
++        hadoopfs::MetadataCache::Instance().Invalidate(GetCacheKey(directory));
+         hdfsCreateDirectory(hdfs, directory.c_str());
+     }
+ 
+diff --git a/src/include/hadoopfs_metadata_cache.hpp b/src/include/hadoopfs_metadata_cache.hpp
+index 437b466..df97cb4 100644
+--- a/src/include/hadoopfs_metadata_cache.hpp
++++ b/src/include/hadoopfs_metadata_cache.hpp
+@@ -3,6 +3,9 @@
+ // headers) so it can be unit tested without HDFS. Every NameNode round trip saved here matters on Kerberos/SASL
+ // clusters: DuckDB opens a Parquet file several times per query (bind, footer, one handle per scan state).
+ //
++// Directory listings (the glob of read_parquet('.../*.parquet')) are cached the same way, under the directory's key
++// without a trailing '/'; invalidating a path also drops the listing of its parent directory.
++//
+ // Rules: entries live ttl_ms after they were fetched (ttl is passed per call: it is a DuckDB setting); only successful
+ // lookups are stored (never errors or "not found"); a fresh status with another length or mtime drops the cached
+ // blocks; at most `capacity` paths (least recently used evicted).
+@@ -15,6 +18,7 @@
+ #include <mutex>
+ #include <string>
+ #include <unordered_map>
++#include <vector>
+ 
+ namespace hadoopfs {
+ 
+@@ -27,8 +31,30 @@ struct CachedFileStatus {
+ 	}
+ };
+ 
++//! one child of a listed directory: the full URL as handed to DuckDB's ListFiles callback
++struct CachedListEntry {
++	std::string path;
++	bool is_dir = false;
++};
++using CachedListing = std::vector<CachedListEntry>;
++
+ class MetadataCache {
+ public:
++	//! key of a directory: no trailing '/' ("nn/t/" and "nn/t" are the same directory)
++	static std::string DirKey(std::string key) {
++		while (key.size() > 1 && key.back() == '/') {
++			key.pop_back();
++		}
++		return key;
++	}
++
++	//! directory key of the parent of key ("nn/t/f0.parquet" -> "nn/t"); empty if none
++	static std::string ParentKey(const std::string &key) {
++		auto dir = DirKey(key);
++		auto slash = dir.rfind('/');
++		return slash == std::string::npos ? std::string() : DirKey(dir.substr(0, slash));
++	}
++
+ 	using Clock = std::function<int64_t()>; // monotonic ms
+ 	static int64_t SteadyMs() {
+ 		return std::chrono::duration_cast<std::chrono::milliseconds>(
+@@ -104,12 +130,42 @@ public:
+ 		entry.blocks_time = clock();
+ 	}
+ 
++	//! listing of directory key fetched less than ttl_ms ago (else null)
++	std::shared_ptr<const CachedListing> GetListing(const std::string &key, int64_t ttl_ms) {
++		if (ttl_ms <= 0) {
++			return nullptr;
++		}
++		std::lock_guard<std::mutex> guard(lock);
++		auto entry = Find(DirKey(key));
++		if (!entry || !entry->listing || clock() - entry->listing_time >= ttl_ms) {
++			listing_misses++;
++			return nullptr;
++		}
++		listing_hits++;
++		return entry->listing;
++	}
++
++	//! a freshly fetched (successful) listing of directory key
++	void PutListing(const std::string &key, std::shared_ptr<const CachedListing> listing) {
++		std::lock_guard<std::mutex> guard(lock);
++		auto &entry = FindOrInsert(DirKey(key));
++		entry.listing = std::move(listing);
++		entry.listing_time = clock();
++	}
++
++	//! drops everything cached for key (status, blocks, its own listing) and the listing of its parent directory
+ 	void Invalidate(const std::string &key) {
+ 		std::lock_guard<std::mutex> guard(lock);
+-		auto it = map.find(key);
+-		if (it != map.end()) {
+-			lru.erase(it->second);
+-			map.erase(it);
++		for (auto &k : {key, DirKey(key)}) {
++			auto it = map.find(k);
++			if (it != map.end()) {
++				lru.erase(it->second);
++				map.erase(it);
++			}
++		}
++		auto parent = map.find(ParentKey(key));
++		if (parent != map.end()) {
++			parent->second->listing.reset();
+ 		}
+ 	}
+ 
+@@ -124,7 +180,8 @@ public:
+ 		return map.size();
+ 	}
+ 
+-	uint64_t status_hits = 0, status_misses = 0, block_hits = 0, block_misses = 0;
++	uint64_t status_hits = 0, status_misses = 0, block_hits = 0, block_misses = 0, listing_hits = 0,
++	         listing_misses = 0;
+ 
+ private:
+ 	struct Entry {
+@@ -135,6 +192,8 @@ private:
+ 		std::shared_ptr<void> blocks;
+ 		CachedFileStatus blocks_status;
+ 		int64_t blocks_time = 0;
++		std::shared_ptr<const CachedListing> listing;
++		int64_t listing_time = 0;
+ 	};
+ 	using List = std::list<Entry>;
+ 
+-- 
+2.43.0
+
