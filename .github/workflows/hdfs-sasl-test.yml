@@ -1,0 +1,47 @@
+name: hdfs sasl test (Kerberos, data transfer privacy)
+
+# Runs a build's extension against a Kerberized single-node HDFS 3.4.1 (KDC + namenode + datanode containers, host
+# network) with dfs.data.transfer.protection=privacy on a non-privileged DataNode port; reads a multi-block file.
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: run id of a build.yml run (artifact hadoopfs-<duckdb_version>-linux_amd64)
+        required: true
+      duckdb_version:
+        description: DuckDB release the extension was built for
+        default: v1.5.6
+
+jobs:
+  hdfs-sasl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: hadoopfs-${{ inputs.duckdb_version }}-linux_amd64
+          path: ext
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: start KDC + secure HDFS
+        run: bash tests/hdfs-sasl/start.sh
+      - name: test data (one Parquet file, 1 MB blocks)
+        run: |
+          curl -sSfL -o duckdb.zip "https://github.com/duckdb/duckdb/releases/download/${{ inputs.duckdb_version }}/duckdb_cli-linux-amd64.zip"
+          unzip -qo duckdb.zip && mkdir -p data
+          ./duckdb -c "COPY (SELECT range AS id, range % 97 AS v, md5(range::VARCHAR) AS s FROM range(300000))
+            TO 'data/big.parquet' (FORMAT parquet, ROW_GROUP_SIZE 20000)"
+          ls -la data
+          H="docker exec -e KRB5CCNAME=/w/krb/nn.ccache nn"
+          $H hdfs dfs -mkdir -p /t
+          $H hdfs dfs -D dfs.blocksize=1048576 -put -f /w/data/big.parquet /t/
+          $H hdfs fsck /t/big.parquet -files -blocks | grep -E "blocks|Total blocks" | head -5
+      - name: test (AlmaLinux 8 container = the extension's runtime libs)
+        run: |
+          docker run --rm --network host -v "$PWD:/w" -w /w -e DUCKDB_VERSION=${{ inputs.duckdb_version }} \
+            almalinux:8 bash tests/hdfs-sasl/run.sh
+      - name: logs
+        if: failure()
+        run: |
+          docker logs kdc 2>&1 | tail -30; docker logs nn 2>&1 | tail -80; docker logs dn 2>&1 | grep -iE "sasl|error|exception|warn" | tail -60
