@@ -31,14 +31,14 @@ Q="SELECT count(*), sum(id), sum(v), count(DISTINCT s) FROM read_parquet('hdfs:/
 want=$($D -csv -noheader -c "${Q/hdfs:\/\/localhost:8020\/t/data};")
 echo "local:   $want"
 # first contact with libhdfs3 debug log + Kerberos trace, shown on failure
-if ! LIBHDFS3_CONF=/tmp/debug.xml KRB5_TRACE=/tmp/krb5.trace $D -unsigned -csv -noheader -c "LOAD '$EXT';
+if ! HDFS_ENABLE_LOGGING=true LIBHDFS3_CONF=/tmp/debug.xml KRB5_TRACE=/tmp/krb5.trace $D -unsigned -csv -noheader -c "LOAD '$EXT';
      SELECT count(*) FROM read_parquet('hdfs://localhost:8020/t/big.parquet');" > /tmp/debug.out 2>&1; then
   tail -c 6000 /tmp/debug.out; echo "--- krb5 trace"; tail -c 4000 /tmp/krb5.trace || true; exit 1
 fi
 grep -m1 "DataTransferSasl: DataNode" /tmp/debug.out || { tail -c 6000 /tmp/debug.out; echo "FAIL: no SASL handshake logged"; exit 1; }
 grep -q "DataTransferSasl: DataNode .*: qop auth-conf, cipher 3des" /tmp/debug.out || { echo "FAIL: privacy without the cipher option is not 3des"; exit 1; }
 if [ -n "$CIPHER" ]; then
-  if ! LIBHDFS3_CONF=/tmp/debug-aes.xml $D -unsigned -csv -noheader -c "LOAD '$EXT';
+  if ! HDFS_ENABLE_LOGGING=true LIBHDFS3_CONF=/tmp/debug-aes.xml $D -unsigned -csv -noheader -c "LOAD '$EXT';
        SELECT count(*) FROM read_parquet('hdfs://localhost:8020/t/big.parquet');" > /tmp/debug-aes.out 2>&1; then
     tail -c 6000 /tmp/debug-aes.out; exit 1
   fi
