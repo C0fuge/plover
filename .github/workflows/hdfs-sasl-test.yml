@@ -57,9 +57,9 @@ jobs:
           fi
       - name: test (AlmaLinux 8 container = the extension's runtime libs)
         run: |
-          docker run --name t -d --network host -v "$PWD:/w" -w /w -e DUCKDB_VERSION=${{ inputs.duckdb_version }} \
+          docker run --name tc -d --network host -v "$PWD:/w" -w /w -e DUCKDB_VERSION=${{ inputs.duckdb_version }} \
             -e DATANODES almalinux:8 sleep infinity
-          docker exec t bash tests/hdfs-sasl/run.sh
+          docker exec tc bash tests/hdfs-sasl/run.sh
       - name: failover test (kill DataNodes between and during scans)
         if: inputs.datanodes >= 3
         run: |
@@ -69,7 +69,7 @@ jobs:
               if [ -f ctl/req ]; then read -r op dn < ctl/req; rm -f ctl/req; docker $op $dn >/dev/null; echo "host: $op $dn"; touch ctl/ack; fi
               sleep 0.1
             done ) &
-          docker exec t bash tests/hdfs-sasl/failover.sh
+          docker exec tc bash tests/hdfs-sasl/failover.sh
       - name: logs
         if: failure()
         run: |
