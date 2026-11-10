@@ -5,6 +5,18 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+> **Session 2026-11-10 (3): item (1) pin bump done - afc8 released (https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc8-duckdb-v1.5.6); nothing open from the maintainer's list.**
+> libhdfs3 pin 94a9ead -> 85dabf0 (master 2026-11-05: c5dc2bd/c67cd2e slow-DataNode avoidance, d9c26dc malformed
+> Datanode/Namenode response validation, 952ee51 no thread/object addresses in logs). Our libhdfs3 0002-0005 applied
+> unchanged (rebased); 0001 conflicted in `InputStreamImpl::choseBestNode` with upstream's `SlowNodeTracker`: merged so
+> that with the tracker enabled it chooses among the replicas not on our dead list first (all replicas if none is left);
+> without it (default) our dead-list choice as before. The slow-node avoidance is **off by default**; to try it put
+> `dfs.client.read.write.metric.enable=true` and `dfs.client.slow.datanode.kickout.enable=true` into LIBHDFS3_CONF
+> (not tested in CI here). Build 42777872495, all tests green (JDK interop 42777876381, HDFS 42779492218, SASL HDFS
+> with 3 DataNodes/AES/failover 42779497473). Remaining candidates, only on request: (3) `dfs.encrypt.data.transfer`
+> (DataEncryptionKey), (4) SASL on the write path, NameNode RPC integrity/privacy (option (A) below), a CI test of the
+> slow-node avoidance together with the dead-node list.
+
 > **Maintainer, 2026-11-10 10:15:** rpc privacy -> (B), leave it: the target cluster works with the current extension,
 > so its `hadoop.rpc.protection` is authentication. Go on with AES (3des at 18-24 MB/s per scan is too slow for the
 > server's direct SASL reads; target: within ~20 % of a plain read).
@@ -149,7 +161,7 @@ Open follow-ups (not asked yet, for the maintainer):
 ## Layout
 - `sources.env` — pinned upstream commits / tarballs (+ sha256)
 - `patches/hadoopfs/` — patches on vincent-chang/duckdb-hdfs 51b7220 (footer version `51b7220-afcN`, N = patch level, set in `scripts/build-ext.sh`)
-- `patches/libhdfs3/` — patches on ClickHouse/libhdfs3 94a9ead (0001 process-wide dead DataNode list; part of the deps cache key)
+- `patches/libhdfs3/` — patches on ClickHouse/libhdfs3 85dabf0 (94a9ead up to afc7) (0001 process-wide dead DataNode list; part of the deps cache key)
 - `tests/libhdfs3/` + `scripts/test-libhdfs3.sh` — unit test of the libhdfs3 patch (no HDFS; CI step before the deps)
 - `scripts/build-deps.sh` — static protobuf 3.21.12, libgsasl 1.10.0, libhdfs3 -> /opt/deps (cached in CI)
 - `scripts/build-ext.sh` — DuckDB `$DUCKDB_VERSION` + extension, EXTENSION_STATIC_BUILD=1, ccache
@@ -189,7 +201,7 @@ OpenSSL. Everything else (libhdfs3, protobuf, gsasl, DuckDB, libstdc++) is insid
 | libhdfs3 0003 DIGEST-MD5 client | `src/rpc/DigestMd5Client.{h,cpp}` (OpenSSL libcrypto): RFC 2831 client with auth / auth-int / auth-conf (3des, des, rc4, rc4-56, rc4-40 as the JDK's DigestMD5Base), rspauth check, wrap/unwrap. libgsasl has no auth-conf. Test `scripts/test-sasl.sh` (RFC 2831 known answer + interop with the JDK's DIGEST-MD5 SaslServer for every QOP/cipher). |
 | libhdfs3 0004 data-transfer SASL (read) | `dfs.data.transfer.protection` (authentication/integrity/privacy): RemoteBlockReader does Hadoop's SaslDataTransferClient handshake on new connections to DataNodes on ports >= 1024 when a block token is present; auth-int/auth-conf through a `SaslSocket` decorator (int32-length frames); pooled connections keep their SaslSocket. Short-circuit and writes unchanged. |
 | libhdfs3 0005 AES/CTR cipher option | `dfs.encrypt.data.transfer.cipher.suites` = `AES/CTR/NoPadding` (with privacy): CipherOptionProto added to datatransfer.proto; the client sends the option with its DIGEST-MD5 response (as SaslDataTransferClient), unwraps the DataNode's inKey/outKey with the auth-conf session and continues on an `AesCtrSocket` (OpenSSL AES-128/192/256-CTR, client writes with inKey/inIv, reads with outKey/outIv). A DataNode without the setting answers without an option -> DIGEST-MD5 3des as before. DEBUG1 log of the negotiated qop/cipher per connection (needs `HDFS_ENABLE_LOGGING=true`). |
-| libhdfs3 0001 dead-node list | `DeadNodes`: process-wide list keyed by DataNode UUID@ip:xferPort. A node whose remote block reader fails (setup timeout/IO error, or read error mid-block) is avoided by all streams for `input.deadnode.ttl` ms (libhdfs3 default with the patch 60000, 0 = upstream behaviour); `choseBestNode` prefers replicas not on the list, a listed one is still tried when it is the only replica left; a successful block reader setup removes the node. EC (striped) reads unchanged. |
+| libhdfs3 0001 dead-node list | `DeadNodes`: process-wide list keyed by DataNode UUID@ip:xferPort. A node whose remote block reader fails (setup timeout/IO error, or read error mid-block) is avoided by all streams for `input.deadnode.ttl` ms (libhdfs3 default with the patch 60000, 0 = upstream behaviour); `choseBestNode` prefers replicas not on the list, a listed one is still tried when it is the only replica left; a successful block reader setup removes the node. EC (striped) reads unchanged. Since afc8 (pin 85dabf0): with upstream's slow-DataNode avoidance enabled, the SlowNodeTracker chooses among the replicas not on the list first, else among all. |
 | libhdfs3 0002 open from block locations | C API `hdfsGetBlockLocationsForRead` / `hdfsOpenFileWithBlockLocations` / `hdfsFreeBlockLocations`: open a read stream from pre-fetched located blocks without the `getBlockLocations` RPC (the stream still fetches further blocks and refreshes after failures). |
 
 libhdfs3 replica failover on a DataNode read timeout: in ceb428c (used by the v1.4.1 build) a timeout while setting up the
@@ -200,10 +212,11 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
 ## Builds
 | date | run | DuckDB | arch | result | time | sha256 |
 |---|---|---|---|---|---|---|
+| 2026-11-10 | 42777872495 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0005 on libhdfs3 85dabf0 (`51b7220-afc8`) — **current**, release `hadoopfs-51b7220-afc8-duckdb-v1.5.6` (release run 42780313283); SASL HDFS test 42779497473 OK, HDFS test 42779492218 OK, JDK interop 42777876381 OK | 6m31s (deps rebuild 3m56s, ext 53 s, ccache 322/324 hits) | 78fdd5d7b9621f6eb1e77cfd9d3f3abd54207bb4d34990c42d0341f6af96dcef |
 | 2026-10-20 | 39412215060 | v1.4.5 | amd64 | OK, patches 0001-0003 (`51b7220-afc1`) | 33m25s (deps 6m42s cold, ext 24m45s cold ccache) | 5e98988006240663d8a189e45c6f6d95fc6418724bb4149170d4fc4c52eb0234 |
 | 2026-10-22 | 39692669742 | v1.4.5 | amd64 | OK, patches 0001-0004 (`51b7220-afc2`) | 2m51s (deps cache hit, ext 64 s, ccache 396/401 hits) | e3c8b077d5041a820e0495cd04fce77a8acf86bd3144d000ccb07fef495d1bce |
 | 2026-10-23 | 39952752512 | v1.4.5 | amd64 | OK, patches 0001-0005 + libhdfs3 0001 (`51b7220-afc3`) | 10m14s (unit tests 4 s, deps rebuild 6m51s, ext 88 s) | 044b5162efed99cb2df395ec2344b80fa5dc07c2a009525b814be9ba32cadecb |
-| 2026-11-10 | 42771355611 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0005 (`51b7220-afc7`) — **current**, release `hadoopfs-51b7220-afc7-duckdb-v1.5.6` (release run 42773268258); SASL HDFS test 42772691546 OK (AES + 3des, failover with AES), HDFS test 42772100404 OK | 6m13s (deps rebuild, ext ccache 322/324 hits) | 5a461ef2bafadf8d1ca149e53ab309d90e483c8a20de12301a76d80eb103f3ab |
+| 2026-11-10 | 42771355611 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0005 (`51b7220-afc7`), release `hadoopfs-51b7220-afc7-duckdb-v1.5.6` (release run 42773268258); SASL HDFS test 42772691546 OK (AES + 3des, failover with AES), HDFS test 42772100404 OK | 6m13s (deps rebuild, ext ccache 322/324 hits) | 5a461ef2bafadf8d1ca149e53ab309d90e483c8a20de12301a76d80eb103f3ab |
 | 2026-11-10 | 42753149137 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0004 (`51b7220-afc6`), release `hadoopfs-51b7220-afc6-duckdb-v1.5.6` (release run 42754920767); SASL HDFS test 42754573118 OK, HDFS test 42753829079 OK | 4m29s (deps rebuild 2m22s, ext 39 s, ccache 322/324 hits) | 836299dc639b2fd0f829723e3c7bfe28a403a04be7244482bde88191d8b40948 |
 | 2026-11-09 | 42701198877 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0002 (`51b7220-afc5`), release `hadoopfs-51b7220-afc5-duckdb-v1.5.6` (release run 42751613733); HDFS test 42702336389 OK | 2m32s (deps cache hit, ext 56 s, ccache 320/324 hits) | bb50f86c1e83e9801bc3638262b3e56e73072208331b35c6d8c6297f732fdf7b |
 | 2026-11-09 | 42643919332 | v1.5.6 | amd64 | OK, patches 0001-0006 + libhdfs3 0001-0002 (`51b7220-afc4`), release `hadoopfs-51b7220-afc4-duckdb-v1.5.6`; HDFS test 42678080745 OK | 16m41s (deps rebuild 4m05s, ext 10m37s, ccache 79/324 hits: first v1.5.6 build) | 64a97a6b08e1f725c980d46f25d664a1c3edde8a73b624ac31bdc75f9095942c |
@@ -222,6 +235,8 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
   12.2 s with SET 3 s), v1.4.1 build -> `TProtocolException: Invalid data` after 3.1 s (another short-read symptom).
 
 ## Open
+- 2026-11-10: item (1) pin bump: libhdfs3 94a9ead -> 85dabf0, patches rebased (0001 merged with SlowNodeTracker in
+  choseBestNode), afc8 build 42777872495 + all tests green on the first try; released afc8.
 - 2026-11-10: item (2) AES done: libhdfs3 0005, afc7 build 42771355611, SASL test 42772691546 (first run 42772097200 failed
   on the test's own check: ClickHouse libhdfs3 logs only with env `HDFS_ENABLE_LOGGING=true`), throughput 3des ~20 MB/s vs
   AES ~130 MB/s; regression HDFS test 42772100404 OK. Released afc7. RPC privacy decision still open.
