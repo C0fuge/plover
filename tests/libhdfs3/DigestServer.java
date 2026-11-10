@@ -73,7 +73,7 @@ public class DigestServer {
                     return;
                 }
                 Random rnd = new Random(42);
-                int[] sizes = {0, 1, 5, 6, 7, 8, 9, 15, 16, 17, 100, 1000, 4096, 65000};
+                int[] sizes = {1, 5, 6, 7, 8, 9, 15, 16, 17, 100, 1000, 4096, 65000};
                 for (int round = 0; round < 3; round++) {
                     for (int n : sizes) {
                         byte[] msg = new byte[n];

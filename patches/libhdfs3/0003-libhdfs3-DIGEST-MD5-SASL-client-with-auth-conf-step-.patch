@@ -1,4 +1,4 @@
-From cfd6b0a3d30192f6c361459c41e8b7626b7eb1b2 Mon Sep 17 00:00:00 2001
+From ed73b959f605cf44cd91c4fdf93368686fd16ce5 Mon Sep 17 00:00:00 2001
 From: C0fuge <189659128+C0fuge@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 03:53:19 +0000
 Subject: [PATCH] libhdfs3: DIGEST-MD5 SASL client with auth-conf (step 1 of
@@ -29,7 +29,7 @@ RemoteBlockReader and a wrapping Socket).
 
 diff --git a/src/rpc/DigestMd5Client.cpp b/src/rpc/DigestMd5Client.cpp
 new file mode 100644
-index 0000000..2d06235
+index 0000000..312960c
 --- /dev/null
 +++ b/src/rpc/DigestMd5Client.cpp
 @@ -0,0 +1,495 @@
@@ -457,7 +457,7 @@ index 0000000..2d06235
 +}
 +
 +std::string DigestMd5Client::wrap(const char * data, size_t len) {
-+    if (!isWrapping()) {
++    if (!isWrapping() || len == 0) {  // the JDK also wraps an empty message to an empty token
 +        return std::string(data, len);
 +    }
 +    unsigned char mac[MAC_LEN];
@@ -483,7 +483,7 @@ index 0000000..2d06235
 +}
 +
 +std::string DigestMd5Client::unwrap(const char * data, size_t len) {
-+    if (!isWrapping()) {
++    if (!isWrapping() || len == 0) {
 +        return std::string(data, len);
 +    }
 +    if (len < MAC_LEN + TRAILER_LEN) {

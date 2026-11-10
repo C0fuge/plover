@@ -32,7 +32,7 @@ queries with a glob over 4 files: cache off 20 getListing + 364 getfileinfo + 36
 - Step 1 (2026-11-10): libhdfs3 **0003** `src/rpc/DigestMd5Client.{h,cpp}` (OpenSSL libcrypto only): RFC 2831 client,
   auth / auth-int / auth-conf, ciphers 3des/des/rc4/rc4-56/rc4-40 as the JDK's DigestMD5Base, rspauth check, wrap/unwrap,
   maxRawSendSize. Test `scripts/test-sasl.sh` + `.github/workflows/sasl-test.yml` (RFC 2831 known answer, then handshake
-  + 42 wrapped messages each way against the JDK's DIGEST-MD5 SaslServer with protocol "hdfs", server "0", for every
+  + 39 wrapped messages each way (1 B .. 65000 B) against the JDK's DIGEST-MD5 SaslServer with protocol "hdfs", server "0", for every
   QOP/cipher, and a wrong password). Not wired in yet.
 - Step 2: wire into the read path. Protocol (Hadoop SaslDataTransferClient/Server): after connect, client writes int
   0xDEADBEEF, then varint-delimited `DataTransferEncryptorMessageProto{status SUCCESS, payload ""}`; DataNode answers with

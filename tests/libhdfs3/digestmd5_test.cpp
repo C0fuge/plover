@@ -169,12 +169,13 @@ static int peer(int argc, char ** argv) {
                 sendFrame(fd, c.wrap(r.data(), r.size()));
                 ++n;
             }
-            // a tampered token must be rejected
+            CHECK(c.wrap("", 0).empty());  // as the JDK
+            // a token not made with the server's keys must be rejected
             std::string t = c.wrap("hello", 5);
-            DigestMd5Client & cc = c;
-            CHECK(throws([&] { cc.unwrap(t.data(), t.size()); }));  // our own token: wrong key/seq for unwrap
+            CHECK(throws([&] { c.unwrap(t.data(), t.size()); }));  // our own token: client keys, not server keys
         }
         printf("client: %d messages echoed\n", n);
+        CHECK(!c.isWrapping() || n == 39);
     } catch (const DigestMd5Error & e) {
         fprintf(stderr, "DigestMd5Error: %s\n", e.what());
         return 1;
