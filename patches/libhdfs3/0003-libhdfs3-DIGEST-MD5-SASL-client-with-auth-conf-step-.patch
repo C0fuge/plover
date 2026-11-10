@@ -1,0 +1,658 @@
+From cfd6b0a3d30192f6c361459c41e8b7626b7eb1b2 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 03:53:19 +0000
+Subject: [PATCH] libhdfs3: DIGEST-MD5 SASL client with auth-conf (step 1 of
+ data-transfer SASL)
+
+libgsasl's DIGEST-MD5 has no confidentiality: it refuses qop=auth-conf
+(and gsasl_encode returns an error for it), so a DataNode with
+dfs.data.transfer.protection=privacy cannot be read through it.
+
+DigestMd5Client (src/rpc/DigestMd5Client.{h,cpp}, OpenSSL libcrypto only):
+- RFC 2831 client: md5-sess, digest-uri protocol/serverName, charset
+  utf-8, maxbuf, rspauth verified (mutual authentication)
+- QOP auth / auth-int / auth-conf chosen from a client preference list
+- auth-int: HMAC-MD5(Kic, seq || msg)[0..9] + type + seq, as the JDK
+- auth-conf: 3des (CBC, EDE K1 K2 K1 with DES parity), des, rc4,
+  rc4-56, rc4-40; key derivation, padding, chained cipher state and
+  sequence numbers as the JDK's DigestMD5Base, which DataNodes use
+- wrap / unwrap / maxRawSendSize for the stream layer
+
+Not wired into the block reader yet (next: SASL handshake in
+RemoteBlockReader and a wrapping Socket).
+---
+ src/rpc/DigestMd5Client.cpp | 495 ++++++++++++++++++++++++++++++++++++
+ src/rpc/DigestMd5Client.h   | 119 +++++++++
+ 2 files changed, 614 insertions(+)
+ create mode 100644 src/rpc/DigestMd5Client.cpp
+ create mode 100644 src/rpc/DigestMd5Client.h
+
+diff --git a/src/rpc/DigestMd5Client.cpp b/src/rpc/DigestMd5Client.cpp
+new file mode 100644
+index 0000000..2d06235
+--- /dev/null
++++ b/src/rpc/DigestMd5Client.cpp
+@@ -0,0 +1,495 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "DigestMd5Client.h"
++
++#include <openssl/crypto.h>
++#include <openssl/evp.h>
++#include <openssl/hmac.h>
++#include <openssl/rand.h>
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++
++namespace Hdfs {
++namespace Internal {
++
++namespace {
++
++const char * const KIC_MAGIC = "Digest session key to client-to-server signing key magic constant";
++const char * const KIS_MAGIC = "Digest session key to server-to-client signing key magic constant";
++const char * const KCC_MAGIC = "Digest H(A1) to client-to-server sealing key magic constant";
++const char * const KCS_MAGIC = "Digest H(A1) to server-to-client sealing key magic constant";
++const size_t DEFAULT_MAXBUF = 65536;
++const size_t MAC_LEN = 10;      // HMAC-MD5 truncated to 10 bytes
++const size_t TRAILER_LEN = 6;   // message type (2) + sequence number (4)
++
++std::string md5(const std::string & s) {
++    unsigned char out[EVP_MAX_MD_SIZE];
++    unsigned int len = 0;
++    if (!EVP_Digest(s.data(), s.size(), out, &len, EVP_md5(), NULL)) {
++        throw DigestMd5Error("DIGEST-MD5: MD5 not available");
++    }
++    return std::string(reinterpret_cast<char *>(out), len);
++}
++
++std::string hex(const std::string & s) {
++    static const char * digits = "0123456789abcdef";
++    std::string r;
++    r.reserve(s.size() * 2);
++    for (size_t i = 0; i < s.size(); ++i) {
++        unsigned char c = static_cast<unsigned char>(s[i]);
++        r.push_back(digits[c >> 4]);
++        r.push_back(digits[c & 15]);
++    }
++    return r;
++}
++
++std::string base64(const unsigned char * data, size_t len) {
++    std::string out(4 * ((len + 2) / 3) + 1, '\0');
++    int n = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(&out[0]), data, static_cast<int>(len));
++    out.resize(n);
++    return out;
++}
++
++void putSeq(unsigned char * p, uint32_t seq) {
++    p[0] = (seq >> 24) & 0xff;
++    p[1] = (seq >> 16) & 0xff;
++    p[2] = (seq >> 8) & 0xff;
++    p[3] = seq & 0xff;
++}
++
++uint32_t getSeq(const unsigned char * p) {
++    return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
++           (static_cast<uint32_t>(p[2]) << 8) | p[3];
++}
++
++/* HMAC-MD5(key, seq || msg), first 10 bytes */
++void mac10(const unsigned char * key, uint32_t seq, const char * msg, size_t len, unsigned char * out) {
++    std::string buf(4 + len, '\0');
++    putSeq(reinterpret_cast<unsigned char *>(&buf[0]), seq);
++    if (len) {
++        memcpy(&buf[4], msg, len);
++    }
++    unsigned char full[EVP_MAX_MD_SIZE];
++    unsigned int flen = 0;
++    if (!HMAC(EVP_md5(), key, 16, reinterpret_cast<const unsigned char *>(buf.data()), buf.size(), full, &flen)) {
++        throw DigestMd5Error("DIGEST-MD5: HMAC-MD5 failed");
++    }
++    memcpy(out, full, MAC_LEN);
++}
++
++std::vector<std::string> splitList(const std::string & s) {
++    std::vector<std::string> r;
++    size_t pos = 0;
++    while (pos <= s.size()) {
++        size_t e = s.find(',', pos);
++        if (e == std::string::npos) {
++            e = s.size();
++        }
++        std::string item = s.substr(pos, e - pos);
++        size_t b = item.find_first_not_of(" \t");
++        size_t f = item.find_last_not_of(" \t");
++        if (b != std::string::npos) {
++            item = item.substr(b, f - b + 1);
++            std::transform(item.begin(), item.end(), item.begin(), ::tolower);
++            r.push_back(item);
++        }
++        pos = e + 1;
++    }
++    return r;
++}
++
++/* RFC 2831 digest-challenge / response-auth: key=value pairs, values quoted (with \ escapes) or tokens;
++ * repeated keys (realm) are kept in order */
++std::multimap<std::string, std::string> parseDirectives(const std::string & s) {
++    std::multimap<std::string, std::string> r;
++    size_t i = 0, n = s.size();
++    while (i < n) {
++        while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == ',' || s[i] == '\r' || s[i] == '\n')) {
++            ++i;
++        }
++        if (i >= n) {
++            break;
++        }
++        size_t k = i;
++        while (i < n && s[i] != '=' && s[i] != ',') {
++            ++i;
++        }
++        std::string key = s.substr(k, i - k);
++        key.erase(key.find_last_not_of(" \t") + 1);
++        std::transform(key.begin(), key.end(), key.begin(), ::tolower);
++        if (i >= n || s[i] != '=') {
++            throw DigestMd5Error("DIGEST-MD5: malformed challenge (directive without value): " + key);
++        }
++        ++i;
++        while (i < n && (s[i] == ' ' || s[i] == '\t')) {
++            ++i;
++        }
++        std::string value;
++        if (i < n && s[i] == '"') {
++            ++i;
++            bool closed = false;
++            while (i < n) {
++                if (s[i] == '\\' && i + 1 < n) {
++                    value.push_back(s[i + 1]);
++                    i += 2;
++                } else if (s[i] == '"') {
++                    ++i;
++                    closed = true;
++                    break;
++                } else {
++                    value.push_back(s[i++]);
++                }
++            }
++            if (!closed) {
++                throw DigestMd5Error("DIGEST-MD5: malformed challenge (unterminated quoted string)");
++            }
++        } else {
++            size_t v = i;
++            while (i < n && s[i] != ',') {
++                ++i;
++            }
++            value = s.substr(v, i - v);
++            value.erase(value.find_last_not_of(" \t\r\n") + 1);
++        }
++        r.insert(std::make_pair(key, value));
++    }
++    return r;
++}
++
++std::string quote(const std::string & s) {
++    std::string r = "\"";
++    for (size_t i = 0; i < s.size(); ++i) {
++        if (s[i] == '"' || s[i] == '\\') {
++            r.push_back('\\');
++        }
++        r.push_back(s[i]);
++    }
++    r.push_back('"');
++    return r;
++}
++
++/* 7 key bytes -> 8 DES key bytes (7 bits each, low bit = odd parity), as the JDK's addDesParity */
++void addDesParity(const unsigned char * in, unsigned char * out) {
++    uint64_t v = 0;
++    for (int i = 0; i < 7; ++i) {
++        v = (v << 8) | in[i];
++    }
++    for (int i = 7; i >= 0; --i) {
++        unsigned char b = static_cast<unsigned char>((v & 0x7f) << 1);
++        v >>= 7;
++        int bits = 0;
++        for (int j = 1; j < 8; ++j) {
++            bits += (b >> j) & 1;
++        }
++        out[i] = b | ((bits & 1) ? 0 : 1);
++    }
++}
++
++EVP_CIPHER_CTX * makeCipher(const std::string & name, const unsigned char * kc, bool encrypt) {
++    const EVP_CIPHER * c = NULL;
++    unsigned char key[24];
++    int keyLen = 0;
++    const unsigned char * iv = NULL;
++    if (name == "3des") {
++        c = EVP_des_ede3_cbc();
++        addDesParity(kc, key);
++        addDesParity(kc + 7, key + 8);
++        memcpy(key + 16, key, 8);
++        keyLen = 24;
++        iv = kc + 8;
++    } else if (name == "des") {
++        c = EVP_des_cbc();
++        addDesParity(kc, key);
++        keyLen = 8;
++        iv = kc + 8;
++    } else if (name == "rc4" || name == "rc4-56" || name == "rc4-40") {
++        c = EVP_rc4();
++        memcpy(key, kc, 16);
++        keyLen = 16;
++    }
++    EVP_CIPHER_CTX * ctx = c ? EVP_CIPHER_CTX_new() : NULL;
++    if (!ctx) {
++        throw DigestMd5Error("DIGEST-MD5: cipher " + name + " not available");
++    }
++    if (!EVP_CipherInit_ex(ctx, c, NULL, NULL, NULL, encrypt ? 1 : 0) ||
++        !EVP_CIPHER_CTX_set_key_length(ctx, keyLen) ||
++        !EVP_CipherInit_ex(ctx, NULL, NULL, key, iv, encrypt ? 1 : 0)) {
++        EVP_CIPHER_CTX_free(ctx);
++        throw DigestMd5Error("DIGEST-MD5: cannot initialize cipher " + name +
++                             " (OpenSSL 3 needs the legacy provider for des/rc4)");
++    }
++    EVP_CIPHER_CTX_set_padding(ctx, 0);
++    return ctx;
++}
++
++void runCipher(void * ctx, const unsigned char * in, size_t len, unsigned char * out) {
++    int outl = 0;
++    if (len && !EVP_CipherUpdate(static_cast<EVP_CIPHER_CTX *>(ctx), out, &outl, in, static_cast<int>(len))) {
++        throw DigestMd5Error("DIGEST-MD5: cipher failed");
++    }
++    if (static_cast<size_t>(outl) != len) {
++        throw DigestMd5Error("DIGEST-MD5: cipher returned a short block");
++    }
++}
++
++}  // namespace
++
++DigestMd5Client::DigestMd5Client(const std::string & username, const std::string & password,
++                                 const std::string & protocol, const std::string & serverName,
++                                 const std::string & qops, const std::string & ciphers)
++    : username(username), password(password), digestUri(protocol + "/" + serverName), qopPref(splitList(qops)),
++      cipherPref(splitList(ciphers)), utf8(false), serverMaxbuf(DEFAULT_MAXBUF), step(0), complete(false),
++      sendSeq(0), recvSeq(0), encCtx(NULL), decCtx(NULL), blockSize(0) {
++    memset(ha1, 0, sizeof(ha1));
++    memset(kic, 0, sizeof(kic));
++    memset(kis, 0, sizeof(kis));
++    memset(kcc, 0, sizeof(kcc));
++    memset(kcs, 0, sizeof(kcs));
++}
++
++DigestMd5Client::~DigestMd5Client() {
++    if (encCtx) {
++        EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX *>(encCtx));
++    }
++    if (decCtx) {
++        EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX *>(decCtx));
++    }
++    memset(ha1, 0, sizeof(ha1));
++    memset(kcc, 0, sizeof(kcc));
++    memset(kcs, 0, sizeof(kcs));
++}
++
++std::string DigestMd5Client::evaluateChallenge(const std::string & challenge) {
++    if (step == 0) {
++        ++step;
++        return firstStep(challenge);
++    }
++    if (step == 1) {
++        ++step;
++        secondStep(challenge);
++        return std::string();
++    }
++    throw DigestMd5Error("DIGEST-MD5: unexpected challenge after completion");
++}
++
++std::string DigestMd5Client::firstStep(const std::string & challenge) {
++    if (challenge.size() > 2048) {
++        throw DigestMd5Error("DIGEST-MD5: challenge too long");
++    }
++    std::multimap<std::string, std::string> d = parseDirectives(challenge);
++    std::multimap<std::string, std::string>::iterator it;
++    if (d.count("nonce") != 1) {
++        throw DigestMd5Error("DIGEST-MD5: challenge needs exactly one nonce");
++    }
++    nonce = d.find("nonce")->second;
++    it = d.find("algorithm");
++    if (it == d.end() || it->second != "md5-sess") {
++        throw DigestMd5Error("DIGEST-MD5: challenge without algorithm=md5-sess");
++    }
++    it = d.find("realm");
++    realm = it == d.end() ? std::string() : it->second;
++    it = d.find("charset");
++    utf8 = it != d.end() && (it->second == "utf-8" || it->second == "UTF-8");
++    it = d.find("maxbuf");
++    if (it != d.end()) {
++        long m = atol(it->second.c_str());
++        if (m <= 0) {
++            throw DigestMd5Error("DIGEST-MD5: bad maxbuf in challenge: " + it->second);
++        }
++        serverMaxbuf = static_cast<size_t>(m);
++    }
++    std::vector<std::string> serverQops;
++    it = d.find("qop");
++    if (it == d.end()) {
++        serverQops.push_back("auth");
++    } else {
++        serverQops = splitList(it->second);
++    }
++    chosenQop.clear();
++    for (size_t i = 0; i < qopPref.size() && chosenQop.empty(); ++i) {
++        if (std::find(serverQops.begin(), serverQops.end(), qopPref[i]) != serverQops.end()) {
++            chosenQop = qopPref[i];
++        }
++    }
++    if (chosenQop.empty()) {
++        throw DigestMd5Error("DIGEST-MD5: no common QOP (server offers " + (it == d.end() ? std::string("auth") : it->second) + ")");
++    }
++    if (chosenQop == "auth-conf") {
++        it = d.find("cipher");
++        std::vector<std::string> serverCiphers = it == d.end() ? std::vector<std::string>() : splitList(it->second);
++        for (size_t i = 0; i < cipherPref.size() && chosenCipher.empty(); ++i) {
++            if (std::find(serverCiphers.begin(), serverCiphers.end(), cipherPref[i]) != serverCiphers.end()) {
++                chosenCipher = cipherPref[i];
++            }
++        }
++        if (chosenCipher.empty()) {
++            throw DigestMd5Error("DIGEST-MD5: no common cipher for auth-conf (server offers " +
++                                 (it == d.end() ? std::string() : it->second) + ")");
++        }
++    }
++    if (cnonce.empty()) {
++        unsigned char r[24];
++        if (RAND_bytes(r, sizeof(r)) != 1) {
++            throw DigestMd5Error("DIGEST-MD5: no random bytes for the client nonce");
++        }
++        cnonce = base64(r, sizeof(r));
++    }
++    // A1 = H(user:realm:password) ":" nonce ":" cnonce  (md5-sess, no authzid)
++    std::string a1 = md5(username + ":" + realm + ":" + password) + ":" + nonce + ":" + cnonce;
++    std::string h = md5(a1);
++    memcpy(ha1, h.data(), 16);
++    std::string zeros = chosenQop == "auth" ? std::string() : ":00000000000000000000000000000000";
++    std::string resp = responseValue("AUTHENTICATE:" + digestUri + zeros);
++    expectedRspauth = responseValue(":" + digestUri + zeros);
++
++    std::string out;
++    if (utf8) {
++        out += "charset=utf-8,";
++    }
++    out += "username=" + quote(username);
++    if (!realm.empty()) {
++        out += ",realm=" + quote(realm);
++    }
++    out += ",nonce=" + quote(nonce) + ",nc=00000001,cnonce=" + quote(cnonce) + ",digest-uri=" + quote(digestUri) +
++           ",maxbuf=" + std::to_string(static_cast<unsigned long long>(DEFAULT_MAXBUF)) + ",response=" + resp +
++           ",qop=" + chosenQop;
++    if (!chosenCipher.empty()) {
++        out += ",cipher=" + chosenCipher;
++    }
++    return out;
++}
++
++std::string DigestMd5Client::responseValue(const std::string & a2) const {
++    // KD(HEX(H(A1)), nonce:nc:cnonce:qop:HEX(H(A2)))
++    std::string ha1hex = hex(std::string(reinterpret_cast<const char *>(ha1), 16));
++    return hex(md5(ha1hex + ":" + nonce + ":00000001:" + cnonce + ":" + chosenQop + ":" + hex(md5(a2))));
++}
++
++void DigestMd5Client::secondStep(const std::string & challenge) {
++    std::multimap<std::string, std::string> d = parseDirectives(challenge);
++    std::multimap<std::string, std::string>::iterator it = d.find("rspauth");
++    if (it == d.end()) {
++        throw DigestMd5Error("DIGEST-MD5: server response without rspauth");
++    }
++    if (it->second != expectedRspauth) {
++        throw DigestMd5Error("DIGEST-MD5: server authentication failed (rspauth mismatch)");
++    }
++    deriveKeys();
++    complete = true;
++}
++
++void DigestMd5Client::deriveKeys() {
++    std::string h(reinterpret_cast<const char *>(ha1), 16);
++    std::string k = md5(h + KIC_MAGIC);
++    memcpy(kic, k.data(), 16);
++    k = md5(h + KIS_MAGIC);
++    memcpy(kis, k.data(), 16);
++    if (chosenQop != "auth-conf") {
++        return;
++    }
++    size_t n = chosenCipher == "rc4-40" ? 5 : chosenCipher == "rc4-56" ? 7 : 16;
++    k = md5(h.substr(0, n) + KCC_MAGIC);
++    memcpy(kcc, k.data(), 16);
++    k = md5(h.substr(0, n) + KCS_MAGIC);
++    memcpy(kcs, k.data(), 16);
++    encCtx = makeCipher(chosenCipher, kcc, true);
++    decCtx = makeCipher(chosenCipher, kcs, false);
++    blockSize = EVP_CIPHER_CTX_block_size(static_cast<EVP_CIPHER_CTX *>(encCtx));
++}
++
++size_t DigestMd5Client::maxRawSendSize() const {
++    // token = [cipher(msg + pad(1..8) + mac)] or [msg + mac], + trailer
++    size_t overhead = MAC_LEN + TRAILER_LEN + (chosenQop == "auth-conf" && blockSize > 1 ? blockSize : 0);
++    return serverMaxbuf > overhead ? serverMaxbuf - overhead : 0;
++}
++
++std::string DigestMd5Client::wrap(const char * data, size_t len) {
++    if (!isWrapping()) {
++        return std::string(data, len);
++    }
++    unsigned char mac[MAC_LEN];
++    mac10(kic, sendSeq, data, len, mac);
++    std::string out;
++    if (chosenQop == "auth-int") {
++        out.assign(data, len);
++        out.append(reinterpret_cast<char *>(mac), MAC_LEN);
++    } else {
++        size_t pad = blockSize > 1 ? blockSize - ((len + MAC_LEN) % blockSize) : 0;
++        std::string plain(data, len);
++        plain.append(pad, static_cast<char>(pad));
++        plain.append(reinterpret_cast<char *>(mac), MAC_LEN);
++        out.resize(plain.size());
++        runCipher(encCtx, reinterpret_cast<const unsigned char *>(plain.data()), plain.size(),
++                  reinterpret_cast<unsigned char *>(&out[0]));
++    }
++    unsigned char trailer[TRAILER_LEN] = {0, 1, 0, 0, 0, 0};
++    putSeq(trailer + 2, sendSeq);
++    out.append(reinterpret_cast<char *>(trailer), TRAILER_LEN);
++    ++sendSeq;
++    return out;
++}
++
++std::string DigestMd5Client::unwrap(const char * data, size_t len) {
++    if (!isWrapping()) {
++        return std::string(data, len);
++    }
++    if (len < MAC_LEN + TRAILER_LEN) {
++        throw DigestMd5Error("DIGEST-MD5: wrapped message too short");
++    }
++    const unsigned char * trailer = reinterpret_cast<const unsigned char *>(data) + len - TRAILER_LEN;
++    if (trailer[0] != 0 || trailer[1] != 1) {
++        throw DigestMd5Error("DIGEST-MD5: wrapped message with a bad message type");
++    }
++    uint32_t seq = getSeq(trailer + 2);
++    if (seq != recvSeq) {
++        throw DigestMd5Error("DIGEST-MD5: wrapped message out of sequence");
++    }
++    size_t body = len - TRAILER_LEN;
++    std::string plain;
++    if (chosenQop == "auth-int") {
++        plain.assign(data, body);
++    } else {
++        if (blockSize > 1 && body % blockSize != 0) {
++            throw DigestMd5Error("DIGEST-MD5: encrypted message is not a multiple of the cipher block size");
++        }
++        plain.resize(body);
++        runCipher(decCtx, reinterpret_cast<const unsigned char *>(data), body, reinterpret_cast<unsigned char *>(&plain[0]));
++    }
++    std::string mac = plain.substr(plain.size() - MAC_LEN);
++    plain.resize(plain.size() - MAC_LEN);
++    if (chosenQop == "auth-conf" && blockSize > 1) {
++        size_t pad = plain.empty() ? 0 : static_cast<unsigned char>(plain[plain.size() - 1]);
++        if (pad < 1 || pad > static_cast<size_t>(blockSize) || pad > plain.size()) {
++            throw DigestMd5Error("DIGEST-MD5: bad padding in an encrypted message");
++        }
++        plain.resize(plain.size() - pad);
++    }
++    unsigned char expected[MAC_LEN];
++    mac10(kis, seq, plain.data(), plain.size(), expected);
++    if (CRYPTO_memcmp(expected, mac.data(), MAC_LEN) != 0) {
++        throw DigestMd5Error("DIGEST-MD5: integrity check failed on a wrapped message");
++    }
++    ++recvSeq;
++    return plain;
++}
++
++}
++}
+diff --git a/src/rpc/DigestMd5Client.h b/src/rpc/DigestMd5Client.h
+new file mode 100644
+index 0000000..1ae6408
+--- /dev/null
++++ b/src/rpc/DigestMd5Client.h
+@@ -0,0 +1,119 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef _HDFS_LIBHDFS3_RPC_DIGESTMD5CLIENT_H_
++#define _HDFS_LIBHDFS3_RPC_DIGESTMD5CLIENT_H_
++
++#include <stdexcept>
++#include <stdint.h>
++#include <string>
++#include <vector>
++
++namespace Hdfs {
++namespace Internal {
++
++class DigestMd5Error : public std::runtime_error {
++public:
++    explicit DigestMd5Error(const std::string & what) : std::runtime_error(what) {}
++};
++
++/**
++ * SASL DIGEST-MD5 client (RFC 2831) with all three QOPs: auth, auth-int (HMAC-MD5 integrity) and
++ * auth-conf (confidentiality with 3des / des / rc4 / rc4-56 / rc4-40, as the JDK's DigestMD5 does).
++ * libgsasl's DIGEST-MD5 has no auth-conf (it refuses qop=auth-conf), which HDFS data transfer with
++ * dfs.data.transfer.protection=privacy needs; this class needs only OpenSSL libcrypto.
++ *
++ * Usage: response = evaluateChallenge(challenge); evaluateChallenge(rspauth) (verifies the server,
++ * returns ""); then isComplete(), qop(), wrap() / unwrap(). Not thread safe (sequence numbers and
++ * cipher state are per direction, as in the JDK: one writer and one reader at a time).
++ */
++class DigestMd5Client {
++public:
++    /**
++     * @param username the SASL user name (for a block token: base64 of the token identifier)
++     * @param password the password (for a block token: base64 of the token password)
++     * @param protocol e.g. "hdfs"; with serverName forms digest-uri "protocol/serverName"
++     * @param serverName e.g. "0" for DataNode data transfer
++     * @param qops client QOP preference, comma separated, out of auth-conf, auth-int, auth
++     * @param ciphers cipher preference for auth-conf, comma separated, out of 3des, rc4, des, rc4-56, rc4-40
++     */
++    DigestMd5Client(const std::string & username, const std::string & password,
++                    const std::string & protocol, const std::string & serverName,
++                    const std::string & qops = "auth-conf,auth-int,auth",
++                    const std::string & ciphers = "3des,rc4,des,rc4-56,rc4-40");
++    ~DigestMd5Client();
++
++    std::string evaluateChallenge(const std::string & challenge);
++
++    bool isComplete() const {
++        return complete;
++    }
++
++    /** negotiated QOP: "auth", "auth-int" or "auth-conf" (valid after the first step) */
++    const std::string & qop() const {
++        return chosenQop;
++    }
++
++    /** negotiated cipher for auth-conf, "" otherwise */
++    const std::string & cipher() const {
++        return chosenCipher;
++    }
++
++    /** true if wrap/unwrap transform data (auth-int or auth-conf) */
++    bool isWrapping() const {
++        return complete && chosenQop != "auth";
++    }
++
++    /** the largest plain message wrap() may be given so that the wrapped token fits the server's maxbuf */
++    size_t maxRawSendSize() const;
++
++    std::string wrap(const char * data, size_t len);
++    std::string unwrap(const char * data, size_t len);
++
++    /** for tests: fixed client nonce instead of a random one */
++    void setCnonce(const std::string & c) {
++        cnonce = c;
++    }
++
++private:
++    DigestMd5Client(const DigestMd5Client &);
++    DigestMd5Client & operator=(const DigestMd5Client &);
++
++    std::string firstStep(const std::string & challenge);
++    void secondStep(const std::string & challenge);
++    std::string responseValue(const std::string & a2) const;
++    void deriveKeys();
++
++    std::string username, password, digestUri;
++    std::vector<std::string> qopPref, cipherPref;
++    std::string realm, nonce, cnonce, chosenQop, chosenCipher, expectedRspauth;
++    bool utf8;
++    size_t serverMaxbuf;
++    int step;
++    bool complete;
++    unsigned char ha1[16];
++    unsigned char kic[16], kis[16], kcc[16], kcs[16];
++    uint32_t sendSeq, recvSeq;
++    void * encCtx; // EVP_CIPHER_CTX
++    void * decCtx;
++    int blockSize;
++};
++
++}
++}
++
++#endif /* _HDFS_LIBHDFS3_RPC_DIGESTMD5CLIENT_H_ */
+-- 
+2.43.0
+

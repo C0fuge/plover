@@ -1,0 +1,18 @@
+name: sasl test (DIGEST-MD5 vs JDK)
+# Cheap check of libhdfs3 patch 0003 (DigestMd5Client) against the JDK's DIGEST-MD5 SaslServer; no HDFS, no deps build.
+on:
+  workflow_dispatch:
+jobs:
+  sasl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: test
+        run: |
+          dpkg -s libssl-dev >/dev/null 2>&1 || sudo apt-get install -y -q libssl-dev
+          WORK_DIR=$RUNNER_TEMP bash scripts/test-sasl.sh

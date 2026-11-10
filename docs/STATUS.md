@@ -17,6 +17,13 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 > (`afc6`). This lets the server read non-local blocks without node-local copies.
 > Pin bump to newer ClickHouse/libhdfs3: only after P4, separately.
 
+**P3 DONE hadoopfs-51b7220-afc5-duckdb-v1.5.6** (2026-11-10; https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc5-duckdb-v1.5.6,
+build 42701198877, HDFS test 42702336389): patch 0007 listing cache, same setting `hdfs_metadata_cache_ttl_ms`. HDFS test, 20 point
+queries with a glob over 4 files: cache off 20 getListing + 364 getfileinfo + 364 getBlockLocations; cache on: 1 getListing,
+0 getfileinfo, 4 getBlockLocations, all in the first query - **0 NameNode calls after the first query**.
+
+**P4 (in progress)** - see "P4 plan" below.
+
 **P1 DONE hadoopfs-51b7220-afc4-duckdb-v1.5.6** (2026-11-09; https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc4-duckdb-v1.5.6,
 build 42643919332, HDFS test 42678080745). Server: `SET hdfs_metadata_cache_ttl_ms = <ms>` (or env `HDFS_METADATA_CACHE_TTL_MS`);
 default 0 = off.
@@ -100,6 +107,7 @@ OpenSSL. Everything else (libhdfs3, protobuf, gsasl, DuckDB, libstdc++) is insid
 | 0004 retry rounds, message | `input.read.max.retry` default 3 (libhdfs3 default 60: with every replica of a block hung a read failed only after 60 x (replicas x read timeout + 1 s), measured 428 s with 2 replicas @ 3 s); LIBHDFS3_CONF still wins. Read error message shows the real offset (was `-1`). |
 | 0005 dead-node TTL | setting `hdfs_dead_node_ttl_ms` (BIGINT ms, env `HDFS_DEAD_NODE_TTL_MS`) -> libhdfs3 `input.deadnode.ttl` (needs libhdfs3 0001). Precedence: setting (>= 0, 0 = off) > LIBHDFS3_CONF > default 60000. |
 | 0006 metadata cache, lazy open, mtime | setting `hdfs_metadata_cache_ttl_ms` (BIGINT ms, env `HDFS_METADATA_CACHE_TTL_MS`, default 0 = off): file status and the located blocks of finalized files cached per namenode+path for that long, 10 000 paths LRU, process-wide; only successful lookups stored; a fresh status with another length/mtime drops the blocks; writes/deletes/renames/truncates invalidate. With the cache on, a read-only file is opened lazily (first read/seek) from the cached locations (libhdfs3 0002): a repeated open costs no NameNode call. `GetLastModifiedTime` fixed (upstream returned seconds*1000 microseconds = January 1970). Unit test `tests/hadoopfs/metadata_cache_test.cpp` (TSan). |
+| 0007 listing cache | `ListFiles` (the glob of `read_parquet`): a successful listing cached per namenode+directory for `hdfs_metadata_cache_ttl_ms` (same LRU as 0006); the listing primes the status cache of its children (no `getfileinfo` after the glob); invalidating a path also drops its parent's listing. |
 | libhdfs3 0001 dead-node list | `DeadNodes`: process-wide list keyed by DataNode UUID@ip:xferPort. A node whose remote block reader fails (setup timeout/IO error, or read error mid-block) is avoided by all streams for `input.deadnode.ttl` ms (libhdfs3 default with the patch 60000, 0 = upstream behaviour); `choseBestNode` prefers replicas not on the list, a listed one is still tried when it is the only replica left; a successful block reader setup removes the node. EC (striped) reads unchanged. |
 | libhdfs3 0002 open from block locations | C API `hdfsGetBlockLocationsForRead` / `hdfsOpenFileWithBlockLocations` / `hdfsFreeBlockLocations`: open a read stream from pre-fetched located blocks without the `getBlockLocations` RPC (the stream still fetches further blocks and refreshes after failures). |
 
@@ -114,7 +122,8 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
 | 2026-10-20 | 39412215060 | v1.4.5 | amd64 | OK, patches 0001-0003 (`51b7220-afc1`) | 33m25s (deps 6m42s cold, ext 24m45s cold ccache) | 5e98988006240663d8a189e45c6f6d95fc6418724bb4149170d4fc4c52eb0234 |
 | 2026-10-22 | 39692669742 | v1.4.5 | amd64 | OK, patches 0001-0004 (`51b7220-afc2`) | 2m51s (deps cache hit, ext 64 s, ccache 396/401 hits) | e3c8b077d5041a820e0495cd04fce77a8acf86bd3144d000ccb07fef495d1bce |
 | 2026-10-23 | 39952752512 | v1.4.5 | amd64 | OK, patches 0001-0005 + libhdfs3 0001 (`51b7220-afc3`) | 10m14s (unit tests 4 s, deps rebuild 6m51s, ext 88 s) | 044b5162efed99cb2df395ec2344b80fa5dc07c2a009525b814be9ba32cadecb |
-| 2026-11-09 | 42643919332 | v1.5.6 | amd64 | OK, patches 0001-0006 + libhdfs3 0001-0002 (`51b7220-afc4`) — **current**, release `hadoopfs-51b7220-afc4-duckdb-v1.5.6`; HDFS test 42678080745 OK | 16m41s (deps rebuild 4m05s, ext 10m37s, ccache 79/324 hits: first v1.5.6 build) | 64a97a6b08e1f725c980d46f25d664a1c3edde8a73b624ac31bdc75f9095942c |
+| 2026-11-09 | 42701198877 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0002 (`51b7220-afc5`) — **current**, release `hadoopfs-51b7220-afc5-duckdb-v1.5.6` (release run 42751613733); HDFS test 42702336389 OK | 3m40s (deps cache hit, ext 56 s, ccache 320/324 hits) | bb50f86c1e83e9801bc3638262b3e56e73072208331b35c6d8c6297f732fdf7b |
+| 2026-11-09 | 42643919332 | v1.5.6 | amd64 | OK, patches 0001-0006 + libhdfs3 0001-0002 (`51b7220-afc4`), release `hadoopfs-51b7220-afc4-duckdb-v1.5.6`; HDFS test 42678080745 OK | 16m41s (deps rebuild 4m05s, ext 10m37s, ccache 79/324 hits: first v1.5.6 build) | 64a97a6b08e1f725c980d46f25d664a1c3edde8a73b624ac31bdc75f9095942c |
 
 ## Verification (local, DuckDB JDBC 1.4.5 in an AlmaLinux 8 container)
 - `afc1`: loads (file must be named `hadoopfs.duckdb_extension`: DuckDB derives the init symbol from the file name);
@@ -130,6 +139,9 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
   12.2 s with SET 3 s), v1.4.1 build -> `TProtocolException: Invalid data` after 3.1 s (another short-read symptom).
 
 ## Open
+- 2026-11-10: P3 done: afc5 (patch 0007 listing cache) build 42701198877 (first try 42699593573 failed: C++14 code, the
+  extension builds with -std=c++11; fixed), HDFS test 42702336389 (getListing 20 -> 1, 0 NameNode calls after the first
+  query), released `hadoopfs-51b7220-afc5-duckdb-v1.5.6`. P4 started: gsasl cannot do DIGEST-MD5 auth-conf (see P4 plan).
 - 2026-11-09: afc4 (patch 0006 + libhdfs3 0002) built for DuckDB v1.5.6 (run 42643919332). HDFS test 42678080745 (after two
   fixes to the test itself: DataNode wait via JMX, JMX metrics cache): 20 point queries over 4 files (4 row groups each), cache off:
   364 getfileinfo + 364 getBlockLocations (36 per query); cache on (600 s): 4 + 4 in total (first query only); results identical,
