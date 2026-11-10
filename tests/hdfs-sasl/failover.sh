@@ -52,10 +52,12 @@ wait_step() { # wait_step: wait for the sentinel, check the result
   echo "step $step: $got in ${secs}s ($(awk -v s="$size" -v t="$secs" 'BEGIN { printf "%.1f", s / 1048576 / t }') MB/s)"
   [ "$got" = "$want" ] || { echo "FAIL: step $step result differs"; cat /tmp/fo.err; exit 1; }
 }
-before=(); for i in $(seq 1 "$N"); do before[$i]=$(blocks_read $i); done
+# DataNode JMX metrics are cached ~10 s: wait before each snapshot
+sleep 11; before=(); for i in $(seq 1 "$N"); do before[$i]=$(blocks_read $i); done
 
 # 1. prime
 send; wait_step; t_full=$secs
+sleep 11
 best=1; served=0
 for i in $(seq 1 "$N"); do
   d=$(( $(blocks_read $i) - before[i] )); echo "dn$i served $d blocks"
