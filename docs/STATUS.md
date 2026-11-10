@@ -5,6 +5,24 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+> **Session 2026-11-10 (2): item (5) done for `hadoop.rpc.protection=authentication`; `privacy` is BLOCKED in libhdfs3 -
+> your decision needed.** Test run 42766835989 (afc6 build 42753149137, 3 DataNodes, replication 2, data transfer privacy,
+> metadata cache on, DuckDB external file cache off, one DuckDB process): 140 MB / 35-block file, blocks served by all 3
+> DataNodes (22/19/34); busiest DataNode killed between scans (cached locations + pooled SaslSockets still point to it):
+> correct, 75 blocks from the other two, 5.7 s; restarted, another DataNode killed 2.2 s into a 6 s scan: correct.
+> Throughput with 3des privacy: 18-24 MB/s per scan (one runner, 2 vCPU).
+> **Finding: libhdfs3 has no NameNode RPC integrity/privacy.** With `hadoop.rpc.protection=privacy` the extension cannot
+> connect (run 42765021834: "Unable to connect to HDFS"; NameNode "Auth failed ... Problem with callback handler").
+> ClickHouse/libhdfs3 had it (cb9a82a, 2016, "support secure rpc transfer ... privacy/integrity/authentication") but
+> **reverted it** in 3f13d9e (2023-02); not in our pin 94a9ead, not in master 85dabf0. (The P2 note below that says RPC SASL
+> "is there with all three QOPs" was wrong.) `git revert 3f13d9e` applies cleanly on 94a9ead (15 files, +402/-62).
+> Options: (A) libhdfs3 patch 0005 = re-apply cb9a82a and fix it (its QOP choice `findPreferred` prefers auth over conf,
+> it reads the server's QOP byte from the last challenge; needs a check that libgsasl 1.10's GSSAPI client does
+> integrity/confidentiality - gsasl_encode/decode via gss_wrap - and which QOP it picks; else reuse our DigestMd5Client for
+> tokens and gss_wrap/gss_unwrap directly for Kerberos), test = this workflow with `-f rpc_protection=privacy`
+> (and `integrity`); (B) leave it, if the server's cluster uses `hadoop.rpc.protection=authentication` (it must, if the
+> extension connects there today). Recommendation: (A) before (2) AES, if the real cluster needs it.
+
 > **Maintainer, 2026-11-10 08:20 - next, in this order (from your candidate list):** (5) first: the SASL HDFS test with
 > 2-3 DataNodes and `hadoop.rpc.protection=privacy` too: non-local block reads, a DataNode killed mid-scan (failover to
 > another replica under SASL), metadata cache on; (2) AES cipher-option negotiation (`dfs.encrypt.data.transfer.cipher.suites`
@@ -141,9 +159,12 @@ Open follow-ups (not asked yet, for the maintainer):
   checks results and mtime (`-f build_run_id=<id> -f duckdb_version=v1.5.6`)
 - `scripts/test-sasl.sh` + `.github/workflows/sasl-test.yml` + `tests/libhdfs3/digestmd5_test.cpp`, `DigestServer.java` — libhdfs3 0003
   DIGEST-MD5 client vs the JDK's SaslServer (ubuntu runner, ~40 s, no deps)
-- `.github/workflows/hdfs-sasl-test.yml` + `tests/hdfs-sasl/` — Kerberos (KDC container) single-node HDFS 3.4.1 with
-  `dfs.data.transfer.protection=privacy`, DataNode on 9866, reads an 11-block file through the extension, checks a plain
-  read is refused (`-f build_run_id=<id> -f duckdb_version=v1.5.6`, ~2 min)
+- `.github/workflows/hdfs-sasl-test.yml` + `tests/hdfs-sasl/` — Kerberos (KDC container) HDFS 3.4.1 with
+  `dfs.data.transfer.protection=privacy`, 1..3 DataNodes (`-f datanodes=3`, default; ports 9866/9876/9886, replication
+  min(2,N)), `-f rpc_protection=authentication|integrity|privacy`; reads an 11-block file through the extension, checks a
+  plain read is refused; with 3 DataNodes also `failover.sh` (kill the busiest DataNode between scans, restart, kill
+  another mid-scan; one DuckDB process fed by a FIFO, the workflow's host loop does docker kill/start)
+  (`-f build_run_id=<id> -f duckdb_version=v1.5.6`, ~3.5 min)
 - `.github/workflows/release.yml` — attaches a build run's extension + `.sha256` to a release (`-f build_run_id -f tag`)
 
 Runtime needs (dynamically linked, from the OS): libxml2, MIT krb5 (gssapi_krb5/krb5/k5crypto/com_err), libuuid,
@@ -193,6 +214,10 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
   12.2 s with SET 3 s), v1.4.1 build -> `TProtocolException: Invalid data` after 3.1 s (another short-read symptom).
 
 ## Open
+- 2026-11-10: item (5) multi-DataNode SASL test: 3 DataNodes + failover green with rpc authentication (run 42766835989,
+  after test fixes in 42764563840/42765018742/42765611346/42766154093: container name, DataNode JMX metrics cache, DuckDB's
+  external file cache hid the reads); rpc privacy fails in libhdfs3 (run 42765021834) - see Next steps. No code change,
+  no new release (afc6 stays current).
 - 2026-11-10: P3 done: afc5 (patch 0007 listing cache) build 42701198877 (first try 42699593573 failed: C++14 code, the
   extension builds with -std=c++11; fixed), HDFS test 42702336389 (getListing 20 -> 1, 0 NameNode calls after the first
   query), released `hadoopfs-51b7220-afc5-duckdb-v1.5.6`. P4 started: gsasl cannot do DIGEST-MD5 auth-conf (see P4 plan).
