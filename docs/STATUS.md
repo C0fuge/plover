@@ -5,6 +5,12 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+> **Maintainer, 2026-11-10 08:20 - next, in this order (from your candidate list):** (5) first: the SASL HDFS test with
+> 2-3 DataNodes and `hadoop.rpc.protection=privacy` too: non-local block reads, a DataNode killed mid-scan (failover to
+> another replica under SASL), metadata cache on; (2) AES cipher-option negotiation (`dfs.encrypt.data.transfer.cipher.suites`
+> = AES/CTR/NoPadding) with a throughput number 3des vs AES on a large scan; (1) the pin bump to newer ClickHouse/libhdfs3
+> as its own build; (3) and (4) only on request. Release each as afc7, afc8, ... with the tests green.
+
 > **Session 2026-11-10: P3 and P4 done (afc5, afc6 released).** Nothing open from the maintainer's list. Candidates, waiting
 > for the maintainer's choice: (1) pin bump to newer ClickHouse/libhdfs3 (c5dc2bd slow-DataNode avoidance, d9c26dc malformed
 > response validation; overlaps our libhdfs3 0001; maintainer: only after P4 - now possible); (2) AES cipher option for
