@@ -5,6 +5,13 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+> **Session 2026-11-10: P3 and P4 done (afc5, afc6 released).** Nothing open from the maintainer's list. Candidates, waiting
+> for the maintainer's choice: (1) pin bump to newer ClickHouse/libhdfs3 (c5dc2bd slow-DataNode avoidance, d9c26dc malformed
+> response validation; overlaps our libhdfs3 0001; maintainer: only after P4 - now possible); (2) AES cipher option for
+> privacy (CipherOptionProto in datatransfer.proto, AES/CTR keys unwrapped with DigestMd5Client; much faster than 3des for
+> large scans); (3) `dfs.encrypt.data.transfer` (DataEncryptionKey via getDataEncryptionKey); (4) SASL on the write path
+> (Pipeline); (5) CI: the SASL test with `hadoop.rpc.protection=privacy` too and 2 DataNodes (non-local reads + failover).
+
 > **Maintainer, 2026-11-10 00:10 - answers.** Thanks for P1/P2. Next, in this order:
 > **P3 (small, first):** listing cache with the same TTL (`getListing` of a directory / the glob of `read_parquet`),
 > invalidated with the metadata cache; HDFS test: a repeated point query with a glob makes 0 NameNode calls after the
@@ -22,7 +29,13 @@ build 42701198877, HDFS test 42702336389): patch 0007 listing cache, same settin
 queries with a glob over 4 files: cache off 20 getListing + 364 getfileinfo + 364 getBlockLocations; cache on: 1 getListing,
 0 getfileinfo, 4 getBlockLocations, all in the first query - **0 NameNode calls after the first query**.
 
-**P4 (in progress)**
+**P4 DONE hadoopfs-51b7220-afc6-duckdb-v1.5.6** (2026-11-10; https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc6-duckdb-v1.5.6,
+build 42753149137, SASL HDFS test 42754573118, regression HDFS test 42753829079, JDK interop test 42752599247). Server: put
+`dfs.data.transfer.protection` (same value as the cluster, e.g. `privacy`) and `hadoop.security.authentication=kerberos` into the
+LIBHDFS3_CONF file; then non-local blocks are read from DataNodes on non-privileged ports with SASL (DIGEST-MD5 on the block token,
+auth-conf with 3des preferred). Not covered: `dfs.encrypt.data.transfer` (DataEncryptionKey), the AES cipher-option
+negotiation (`dfs.encrypt.data.transfer.cipher.suites`; without it the DataNode wraps with DIGEST-MD5 3des, slower than
+AES), and the write path (Pipeline) - see Next steps.
 
 **P4 plan** (SASL data-transfer protection, read path, libhdfs3 patches 0003+):
 - Finding 2026-11-10: libgsasl (1.10.0 and gsasl master 2026-09) DIGEST-MD5 has **no auth-conf**: the client step returns
@@ -34,20 +47,20 @@ queries with a glob over 4 files: cache off 20 getListing + 364 getfileinfo + 36
   maxRawSendSize. Test `scripts/test-sasl.sh` + `.github/workflows/sasl-test.yml` (RFC 2831 known answer, then handshake
   + 39 wrapped messages each way (1 B .. 65000 B) against the JDK's DIGEST-MD5 SaslServer with protocol "hdfs", server "0", for every
   QOP/cipher, and a wrong password). Not wired in yet.
-- Step 2 (2026-11-10, written, CI pending): libhdfs3 **0004** `src/client/DataTransferSasl.{h,cpp}` + RemoteBlockReader +
+- Step 2 (2026-11-10, done): libhdfs3 **0004** `src/client/DataTransferSasl.{h,cpp}` + RemoteBlockReader +
   SessionConfig `dfs.data.transfer.protection`. Protocol as Hadoop SaslDataTransferClient: int 0xDEADBEEF, varint-delimited
   `DataTransferEncryptorMessageProto{SUCCESS, payload ""}`, challenge, response (user base64(token identifier), password
   base64(token password), digest-uri `hdfs/0`), rspauth; ERROR / ERROR_UNKNOWN_KEY -> HdfsIOException (next replica).
   auth-int/auth-conf: `SaslSocket : Socket` decorator, frames `int32 length + token` both ways (writes chunked by
   maxRawSendSize, poll(read) true while unwrapped bytes are buffered); only new connections do the handshake, pooled
   ones are the SaslSocket already. Used when protection set + block token non-empty + xfer port >= 1024.
-- Step 3 (2026-11-10, written, CI pending): `.github/workflows/hdfs-sasl-test.yml` + `tests/hdfs-sasl/` (kdc.sh: MIT KDC
+- Step 3 (2026-11-10, done, run 42754573118): `.github/workflows/hdfs-sasl-test.yml` + `tests/hdfs-sasl/` (kdc.sh: MIT KDC
   in almalinux:8, realm EXAMPLE.TEST, principals nn/dn/HTTP@localhost + client, keytabs and ccaches in ./krb; start.sh:
   Hadoop 3.4.1 with kerberos, block tokens, `dfs.data.transfer.protection=privacy`, DataNode 9866,
   `ignore.secure.ports.for.testing=true` (no HTTPS needed), webhdfs off; run.sh: kinit, LIBHDFS3_CONF with
   hadoop.security.authentication=kerberos + protection privacy, full scan + point reads of an 11-block file (1 MB blocks)
   vs the local file, cache off/on; negative check: without the client setting the read must fail).
-  Expect a few iterations on the Kerberos container setup (principal/hostname canonicalization, ccache permissions).
+  Gotcha: MIT krb5 >= 1.18 appends the DNS search domain to `localhost` (`qualify_shortname`) -> krb5.conf sets it to "".
 - Later/cheap: `dfs.encrypt.data.transfer` (DataEncryptionKey from getDataEncryptionKey, user = keyId/blockPoolId/nonce
   form) and the AES cipher option (CipherOptionProto is missing from our datatransfer.proto).
 
@@ -120,6 +133,11 @@ Open follow-ups (not asked yet, for the maintainer):
 - `.github/workflows/hdfs-test.yml` + `tests/hdfs/` — runs a build's extension against a single-node HDFS 3.4.1 (containers) and
   counts NameNode RPCs (JMX NameNodeActivity, read after the 10 s metrics cache) per repeated point query, cache off vs on;
   checks results and mtime (`-f build_run_id=<id> -f duckdb_version=v1.5.6`)
+- `scripts/test-sasl.sh` + `.github/workflows/sasl-test.yml` + `tests/libhdfs3/digestmd5_test.cpp`, `DigestServer.java` — libhdfs3 0003
+  DIGEST-MD5 client vs the JDK's SaslServer (ubuntu runner, ~40 s, no deps)
+- `.github/workflows/hdfs-sasl-test.yml` + `tests/hdfs-sasl/` — Kerberos (KDC container) single-node HDFS 3.4.1 with
+  `dfs.data.transfer.protection=privacy`, DataNode on 9866, reads an 11-block file through the extension, checks a plain
+  read is refused (`-f build_run_id=<id> -f duckdb_version=v1.5.6`, ~2 min)
 - `.github/workflows/release.yml` — attaches a build run's extension + `.sha256` to a release (`-f build_run_id -f tag`)
 
 Runtime needs (dynamically linked, from the OS): libxml2, MIT krb5 (gssapi_krb5/krb5/k5crypto/com_err), libuuid,
@@ -135,6 +153,8 @@ OpenSSL. Everything else (libhdfs3, protobuf, gsasl, DuckDB, libstdc++) is insid
 | 0005 dead-node TTL | setting `hdfs_dead_node_ttl_ms` (BIGINT ms, env `HDFS_DEAD_NODE_TTL_MS`) -> libhdfs3 `input.deadnode.ttl` (needs libhdfs3 0001). Precedence: setting (>= 0, 0 = off) > LIBHDFS3_CONF > default 60000. |
 | 0006 metadata cache, lazy open, mtime | setting `hdfs_metadata_cache_ttl_ms` (BIGINT ms, env `HDFS_METADATA_CACHE_TTL_MS`, default 0 = off): file status and the located blocks of finalized files cached per namenode+path for that long, 10 000 paths LRU, process-wide; only successful lookups stored; a fresh status with another length/mtime drops the blocks; writes/deletes/renames/truncates invalidate. With the cache on, a read-only file is opened lazily (first read/seek) from the cached locations (libhdfs3 0002): a repeated open costs no NameNode call. `GetLastModifiedTime` fixed (upstream returned seconds*1000 microseconds = January 1970). Unit test `tests/hadoopfs/metadata_cache_test.cpp` (TSan). |
 | 0007 listing cache | `ListFiles` (the glob of `read_parquet`): a successful listing cached per namenode+directory for `hdfs_metadata_cache_ttl_ms` (same LRU as 0006); the listing primes the status cache of its children (no `getfileinfo` after the glob); invalidating a path also drops its parent's listing. |
+| libhdfs3 0003 DIGEST-MD5 client | `src/rpc/DigestMd5Client.{h,cpp}` (OpenSSL libcrypto): RFC 2831 client with auth / auth-int / auth-conf (3des, des, rc4, rc4-56, rc4-40 as the JDK's DigestMD5Base), rspauth check, wrap/unwrap. libgsasl has no auth-conf. Test `scripts/test-sasl.sh` (RFC 2831 known answer + interop with the JDK's DIGEST-MD5 SaslServer for every QOP/cipher). |
+| libhdfs3 0004 data-transfer SASL (read) | `dfs.data.transfer.protection` (authentication/integrity/privacy): RemoteBlockReader does Hadoop's SaslDataTransferClient handshake on new connections to DataNodes on ports >= 1024 when a block token is present; auth-int/auth-conf through a `SaslSocket` decorator (int32-length frames); pooled connections keep their SaslSocket. Short-circuit and writes unchanged. |
 | libhdfs3 0001 dead-node list | `DeadNodes`: process-wide list keyed by DataNode UUID@ip:xferPort. A node whose remote block reader fails (setup timeout/IO error, or read error mid-block) is avoided by all streams for `input.deadnode.ttl` ms (libhdfs3 default with the patch 60000, 0 = upstream behaviour); `choseBestNode` prefers replicas not on the list, a listed one is still tried when it is the only replica left; a successful block reader setup removes the node. EC (striped) reads unchanged. |
 | libhdfs3 0002 open from block locations | C API `hdfsGetBlockLocationsForRead` / `hdfsOpenFileWithBlockLocations` / `hdfsFreeBlockLocations`: open a read stream from pre-fetched located blocks without the `getBlockLocations` RPC (the stream still fetches further blocks and refreshes after failures). |
 
@@ -149,7 +169,8 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
 | 2026-10-20 | 39412215060 | v1.4.5 | amd64 | OK, patches 0001-0003 (`51b7220-afc1`) | 33m25s (deps 6m42s cold, ext 24m45s cold ccache) | 5e98988006240663d8a189e45c6f6d95fc6418724bb4149170d4fc4c52eb0234 |
 | 2026-10-22 | 39692669742 | v1.4.5 | amd64 | OK, patches 0001-0004 (`51b7220-afc2`) | 2m51s (deps cache hit, ext 64 s, ccache 396/401 hits) | e3c8b077d5041a820e0495cd04fce77a8acf86bd3144d000ccb07fef495d1bce |
 | 2026-10-23 | 39952752512 | v1.4.5 | amd64 | OK, patches 0001-0005 + libhdfs3 0001 (`51b7220-afc3`) | 10m14s (unit tests 4 s, deps rebuild 6m51s, ext 88 s) | 044b5162efed99cb2df395ec2344b80fa5dc07c2a009525b814be9ba32cadecb |
-| 2026-11-09 | 42701198877 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0002 (`51b7220-afc5`) — **current**, release `hadoopfs-51b7220-afc5-duckdb-v1.5.6` (release run 42751613733); HDFS test 42702336389 OK | 3m40s (deps cache hit, ext 56 s, ccache 320/324 hits) | bb50f86c1e83e9801bc3638262b3e56e73072208331b35c6d8c6297f732fdf7b |
+| 2026-11-10 | 42753149137 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0004 (`51b7220-afc6`) — **current**, release `hadoopfs-51b7220-afc6-duckdb-v1.5.6` (release run 42754920767); SASL HDFS test 42754573118 OK, HDFS test 42753829079 OK | 4m29s (deps rebuild 2m22s, ext 39 s, ccache 322/324 hits) | 836299dc639b2fd0f829723e3c7bfe28a403a04be7244482bde88191d8b40948 |
+| 2026-11-09 | 42701198877 | v1.5.6 | amd64 | OK, patches 0001-0007 + libhdfs3 0001-0002 (`51b7220-afc5`), release `hadoopfs-51b7220-afc5-duckdb-v1.5.6` (release run 42751613733); HDFS test 42702336389 OK | 2m32s (deps cache hit, ext 56 s, ccache 320/324 hits) | bb50f86c1e83e9801bc3638262b3e56e73072208331b35c6d8c6297f732fdf7b |
 | 2026-11-09 | 42643919332 | v1.5.6 | amd64 | OK, patches 0001-0006 + libhdfs3 0001-0002 (`51b7220-afc4`), release `hadoopfs-51b7220-afc4-duckdb-v1.5.6`; HDFS test 42678080745 OK | 16m41s (deps rebuild 4m05s, ext 10m37s, ccache 79/324 hits: first v1.5.6 build) | 64a97a6b08e1f725c980d46f25d664a1c3edde8a73b624ac31bdc75f9095942c |
 
 ## Verification (local, DuckDB JDBC 1.4.5 in an AlmaLinux 8 container)
@@ -169,6 +190,11 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
 - 2026-11-10: P3 done: afc5 (patch 0007 listing cache) build 42701198877 (first try 42699593573 failed: C++14 code, the
   extension builds with -std=c++11; fixed), HDFS test 42702336389 (getListing 20 -> 1, 0 NameNode calls after the first
   query), released `hadoopfs-51b7220-afc5-duckdb-v1.5.6`. P4 started: gsasl cannot do DIGEST-MD5 auth-conf (see P4 plan).
+- 2026-11-10: P4 done. libhdfs3 0003 (DigestMd5Client; JDK interop test 42752599247 green after 2 test fixes: LSan on OpenSSL's
+  globals, the JDK wraps an empty message to an empty token) + 0004 (data-transfer SASL on the read path); afc6 build
+  42753149137; SASL HDFS test 42754573118 (third run; fixes: krb5 qualify_shortname): 11-block file, privacy, full scan and
+  point reads identical to the local file with the metadata cache off/on, plain read refused; regression HDFS test 42753829079
+  OK. Released `hadoopfs-51b7220-afc6-duckdb-v1.5.6`.
 - 2026-11-09: afc4 (patch 0006 + libhdfs3 0002) built for DuckDB v1.5.6 (run 42643919332). HDFS test 42678080745 (after two
   fixes to the test itself: DataNode wait via JMX, JMX metrics cache): 20 point queries over 4 files (4 row groups each), cache off:
   364 getfileinfo + 364 getBlockLocations (36 per query); cache on (600 s): 4 + 4 in total (first query only); results identical,
