@@ -1,7 +1,7 @@
-From 99800fb23e53cb4637f94cd9449db5b00d7f9bcd Mon Sep 17 00:00:00 2001
+From 2b0970b9bf77e56dc80eed0ec5f98601d7c9689e Mon Sep 17 00:00:00 2001
 From: C0fuge <189659128+C0fuge@users.noreply.github.com>
 Date: Mon, 9 Nov 2026 15:16:17 +0000
-Subject: [PATCH] Open read streams from pre-fetched block locations (no
+Subject: [PATCH 2/5] Open read streams from pre-fetched block locations (no
  namenode round trip)
 
 hdfsOpenFile(O_RDONLY) always calls getBlockLocations on the namenode. A

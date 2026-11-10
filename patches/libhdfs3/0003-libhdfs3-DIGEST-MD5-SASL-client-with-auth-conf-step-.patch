@@ -1,8 +1,8 @@
-From ed73b959f605cf44cd91c4fdf93368686fd16ce5 Mon Sep 17 00:00:00 2001
+From f7de3a2ea9a0381798212e51a00d0bf354ed8a67 Mon Sep 17 00:00:00 2001
 From: C0fuge <189659128+C0fuge@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 03:53:19 +0000
-Subject: [PATCH] libhdfs3: DIGEST-MD5 SASL client with auth-conf (step 1 of
- data-transfer SASL)
+Subject: [PATCH 3/5] libhdfs3: DIGEST-MD5 SASL client with auth-conf (step 1
+ of data-transfer SASL)
 
 libgsasl's DIGEST-MD5 has no confidentiality: it refuses qop=auth-conf
 (and gsasl_encode returns an error for it), so a DataNode with

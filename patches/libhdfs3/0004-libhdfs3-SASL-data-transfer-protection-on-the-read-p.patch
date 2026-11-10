@@ -1,7 +1,7 @@
-From 4f4fb78e9a0deee785c0ee967a35cfb1d2b62989 Mon Sep 17 00:00:00 2001
+From 98e3dfe3c7ab1f3718f20dcd3510a560f52b1ba2 Mon Sep 17 00:00:00 2001
 From: C0fuge <189659128+C0fuge@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 03:59:13 +0000
-Subject: [PATCH] libhdfs3: SASL data-transfer protection on the read path
+Subject: [PATCH 4/5] libhdfs3: SASL data-transfer protection on the read path
  (dfs.data.transfer.protection)
 
 A DataNode on a non-privileged port with dfs.data.transfer.protection
@@ -417,7 +417,7 @@ index 0000000..ad2a093
 +
 +#endif /* _HDFS_LIBHDFS3_CLIENT_DATATRANSFERSASL_H_ */
 diff --git a/src/client/RemoteBlockReader.cpp b/src/client/RemoteBlockReader.cpp
-index e43a698..db9e482 100644
+index d832001..cff6b7d 100644
 --- a/src/client/RemoteBlockReader.cpp
 +++ b/src/client/RemoteBlockReader.cpp
 @@ -28,6 +28,7 @@
@@ -428,7 +428,7 @@ index e43a698..db9e482 100644
  #include "Exception.h"
  #include "ExceptionInternal.h"
  #include "HWCrc32c.h"
-@@ -51,6 +52,7 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+@@ -57,6 +58,7 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
                                       SessionConfig& conf)
      : sentStatus(false),
        verify(verify),
@@ -436,7 +436,7 @@ index e43a698..db9e482 100644
        binfo(eb),
        datanode(datanode),
        checksumSize(0),
-@@ -67,6 +69,17 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+@@ -73,6 +75,17 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
      writeTimeout = conf.getInputWriteTimeout();
      connTimeout = conf.getInputConnTimeout();
      sock = getNextPeer(datanode, conf.connectViaHostname());
@@ -454,7 +454,7 @@ index e43a698..db9e482 100644
      in = shared_ptr<BufferedSocketReader>(new BufferedSocketReaderImpl(*sock));
      sender = shared_ptr<DataTransferProtocol>(new DataTransferProtocolSender(
          *sock, writeTimeout, datanode.formatAddress()));
-@@ -86,6 +99,7 @@ shared_ptr<Socket> RemoteBlockReader::getNextPeer(const DatanodeInfo& dn, const
+@@ -92,6 +105,7 @@ shared_ptr<Socket> RemoteBlockReader::getNextPeer(const DatanodeInfo& dn, const
      shared_ptr<Socket> sock;
      try {
          sock = peerCache.getConnection(dn);
@@ -475,10 +475,10 @@ index 9d91ad2..3a66ea8 100644
      DatanodeInfo datanode;
      int checksumSize;
 diff --git a/src/common/SessionConfig.cpp b/src/common/SessionConfig.cpp
-index a94cce9..f75a679 100644
+index 6c4dcc5..9afc427 100644
 --- a/src/common/SessionConfig.cpp
 +++ b/src/common/SessionConfig.cpp
-@@ -150,7 +150,8 @@ SessionConfig::SessionConfig(const Config & conf) {
+@@ -168,7 +168,8 @@ SessionConfig::SessionConfig(const Config & conf) {
          {&rpcAuthMethod, "hadoop.security.authentication", "simple" },
          {&kerberosCachePath, "hadoop.security.kerberos.ticket.cache.path", "" },
          {&logSeverity, "dfs.client.log.severity", "INFO" },
@@ -489,7 +489,7 @@ index a94cce9..f75a679 100644
  
      for (size_t i = 0; i < ARRAYSIZE(boolValues); ++i) {
 diff --git a/src/common/SessionConfig.h b/src/common/SessionConfig.h
-index 644544f..ec36090 100644
+index ad05bac..ac714d2 100644
 --- a/src/common/SessionConfig.h
 +++ b/src/common/SessionConfig.h
 @@ -151,6 +151,14 @@ public:
@@ -507,14 +507,14 @@ index 644544f..ec36090 100644
      /*
       * OutputStream configure
       */
-@@ -369,6 +377,7 @@ public:
+@@ -397,6 +405,7 @@ public:
      int32_t socketCacheCapacity;
      int32_t socketCacheExpiry;
      std::string domainSocketPath;
 +    std::string dataTransferProtection;
      int32_t stripeReaderThreadPoolSize;
- 
-     /*
+     bool readWriteMetricEnabled;
+     bool slowDatanodeKickoutEnabled;
 -- 
 2.43.0
 

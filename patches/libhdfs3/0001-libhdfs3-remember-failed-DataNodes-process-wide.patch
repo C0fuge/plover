@@ -1,7 +1,7 @@
-From f92d2932cd69c2515cb4ac829b9cba3b9b5ec127 Mon Sep 17 00:00:00 2001
+From d6559e6c547618b9440475dc6e8618cc302f4d5f Mon Sep 17 00:00:00 2001
 From: C0fuge <189659128+C0fuge@users.noreply.github.com>
 Date: Fri, 23 Oct 2026 15:20:11 +0300
-Subject: [PATCH] Remember failed DataNodes process-wide with an expiry
+Subject: [PATCH 1/5] Remember failed DataNodes process-wide with an expiry
  (input.deadnode.ttl)
 
 InputStreamImpl forgets a failed DataNode at every block (seekToBlock clears
@@ -21,10 +21,10 @@ it at once. EC (striped) reads are unchanged.
 ---
  src/client/DeadNodes.cpp       | 78 ++++++++++++++++++++++++++++++
  src/client/DeadNodes.h         | 86 ++++++++++++++++++++++++++++++++++
- src/client/InputStreamImpl.cpp | 62 ++++++++++++++++--------
+ src/client/InputStreamImpl.cpp | 82 ++++++++++++++++++++++----------
  src/common/SessionConfig.cpp   |  2 +
  src/common/SessionConfig.h     |  9 ++++
- 5 files changed, 217 insertions(+), 20 deletions(-)
+ 5 files changed, 233 insertions(+), 24 deletions(-)
  create mode 100644 src/client/DeadNodes.cpp
  create mode 100644 src/client/DeadNodes.h
 
@@ -205,20 +205,20 @@ index 0000000..6731805
 +
 +#endif /* _HDFS_LIBHDFS3_CLIENT_DEADNODES_H_ */
 diff --git a/src/client/InputStreamImpl.cpp b/src/client/InputStreamImpl.cpp
-index c549cce..7a142bd 100644
+index d3a30c4..40cf299 100644
 --- a/src/client/InputStreamImpl.cpp
 +++ b/src/client/InputStreamImpl.cpp
-@@ -26,6 +26,7 @@
-  * limitations under the License.
+@@ -27,6 +27,7 @@
   */
+ #include "DateTime.h"
  #include "Exception.h"
 +#include "DeadNodes.h"
  #include "ExceptionInternal.h"
  #include "FileSystemInter.h"
  #include "InputStreamImpl.h"
-@@ -47,6 +48,30 @@
- namespace Hdfs {
- namespace Internal {
+@@ -63,6 +64,30 @@ static void RecordReadMetricsIfNeeded(const shared_ptr<SlowNodeTracker> & slowNo
+     slowNodeTracker->recordRead(datanode, elapsed, path, requestedSize, readSize);
+ }
  
 +/*
 + * Process-wide dead DataNode list (see DeadNodes.h): a node whose remote block reader failed is avoided by every
@@ -247,11 +247,15 @@ index c549cce..7a142bd 100644
  unordered_set<std::string> BuildLocalAddrSet() {
      unordered_set<std::string> set;
      struct ifaddrs * ifAddr = NULL;
-@@ -320,33 +345,22 @@ void InputStreamImpl::seekToBlock(const LocatedBlock & lb) {
+@@ -336,41 +361,42 @@ void InputStreamImpl::seekToBlock(const LocatedBlock & lb) {
  }
  
  bool InputStreamImpl::choseBestNode() {
 -    const std::vector<DatanodeInfo> & nodes = curBlock->getLocations();
+-
+-    if (slowNodeTracker) {
+-        return slowNodeTracker->chooseBestNode(nodes, failedNodes, path, curNode);
+-    }
 -
 -    for (size_t i = 0; i < nodes.size(); ++i) {
 -        if (failedNodes.binary_search(nodes[i])) {
@@ -267,17 +271,37 @@ index c549cce..7a142bd 100644
  }
  
  bool InputStreamImpl::choseBestNode(shared_ptr<LocatedBlock> curBlock, DatanodeInfo & curNode) {
++
      const std::vector<DatanodeInfo> & nodes = curBlock->getLocations();
-+    /* not failed for this block and not on the process-wide dead list; else a dead one if nothing else is left */
-+    int i = DeadNodes::instance().choose(
-+        nodes.size(), [&](size_t k) { return failedNodes.binary_search(nodes[k]); },
-+        [&](size_t k) { return deadNodeKey(nodes[k]); }, conf->getDeadNodeTtl() > 0);
++    if (slowNodeTracker && slowNodeTracker->enabled()) {
++        /* slow-node avoidance (upstream) among the replicas that are not on the dead list; all of them if none is left */
++        if (conf->getDeadNodeTtl() > 0 && DeadNodes::instance().size() > 0) {
++            std::vector<DatanodeInfo> alive;
++
++            for (size_t k = 0; k < nodes.size(); ++k) {
++                if (!DeadNodes::instance().isDead(deadNodeKey(nodes[k]))) {
++                    alive.push_back(nodes[k]);
++                }
++            }
++
++            if (!alive.empty() && slowNodeTracker->chooseBestNode(alive, failedNodes, path, curNode)) {
++                return true;
++            }
++        }
+ 
+-    if (slowNodeTracker) {
+         return slowNodeTracker->chooseBestNode(nodes, failedNodes, path, curNode);
+     }
  
 -    for (size_t i = 0; i < nodes.size(); ++i) {
 -        if (failedNodes.binary_search(nodes[i])) {
 -            continue;
 -        }
--
++    /* not failed for this block and not on the process-wide dead list; else a dead one if nothing else is left */
++    int i = DeadNodes::instance().choose(
++        nodes.size(), [&](size_t k) { return failedNodes.binary_search(nodes[k]); },
++        [&](size_t k) { return deadNodeKey(nodes[k]); }, conf->getDeadNodeTtl() > 0);
+ 
 -        curNode = nodes[i];
 -        return true;
 +    if (i < 0) {
@@ -290,7 +314,7 @@ index c549cce..7a142bd 100644
  }
  
  bool InputStreamImpl::isLocalNode() {
-@@ -422,6 +436,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
+@@ -446,6 +472,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
                      curBlock->getToken(), clientName, verify, *conf));
              }
  
@@ -298,7 +322,7 @@ index c549cce..7a142bd 100644
              break;
          } catch (const HdfsTimeoutException & e) {
              lastException = current_exception();
-@@ -432,6 +447,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
+@@ -456,6 +483,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
                  curNode.formatAddress().c_str(), GetExceptionDetail(e, buffer));
              failedNodes.push_back(curNode);
              failedNodes.sort();
@@ -306,7 +330,7 @@ index c549cce..7a142bd 100644
          } catch (const HdfsIOException & e) {
              lastException = current_exception();
              std::string buffer;
-@@ -453,6 +469,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
+@@ -477,6 +505,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead) {
                      curNode.formatAddress().c_str(), GetExceptionDetail(e, buffer));
                  failedNodes.push_back(curNode);
                  failedNodes.sort();
@@ -314,7 +338,7 @@ index c549cce..7a142bd 100644
              }
          }
      }
-@@ -523,6 +540,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
+@@ -547,6 +576,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
                          curBlock->getToken(), clientName, verify, *conf));
              }
  
@@ -322,7 +346,7 @@ index c549cce..7a142bd 100644
              break;
          } catch (const HdfsTimeoutException & e) {
              lastException = current_exception();
-@@ -533,6 +551,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
+@@ -557,6 +587,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
                  curNode.formatAddress().c_str(), GetExceptionDetail(e, buffer));
              failedNodes.push_back(curNode);
              failedNodes.sort();
@@ -330,7 +354,7 @@ index c549cce..7a142bd 100644
          } catch (const HdfsIOException & e) {
              lastException = current_exception();
              std::string buffer;
-@@ -554,6 +573,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
+@@ -578,6 +609,7 @@ void InputStreamImpl::setupBlockReader(bool temporaryDisableLocalRead, shared_pt
                      curNode.formatAddress().c_str(), GetExceptionDetail(e, buffer));
                  failedNodes.push_back(curNode);
                  failedNodes.sort();
@@ -338,7 +362,7 @@ index c549cce..7a142bd 100644
              }
          }
      }
-@@ -719,6 +739,7 @@ int32_t InputStreamImpl::readOneBlock(char * buf, int32_t size, bool shouldUpdat
+@@ -747,6 +779,7 @@ int32_t InputStreamImpl::readOneBlock(char * buf, int32_t size, bool shouldUpdat
                  curNode.formatAddress().c_str(), path.c_str());
              failedNodes.push_back(curNode);
              failedNodes.sort();
@@ -346,7 +370,7 @@ index c549cce..7a142bd 100644
          }
  
          blockReader.reset();
-@@ -1062,6 +1083,7 @@ void InputStreamImpl::fetchBlockByteRange(shared_ptr<LocatedBlock> curBlock, int
+@@ -1092,6 +1125,7 @@ void InputStreamImpl::fetchBlockByteRange(shared_ptr<LocatedBlock> curBlock, int
                  curNode.formatAddress().c_str(), path.c_str());
              failedNodes.push_back(curNode);
              failedNodes.sort();
@@ -355,10 +379,10 @@ index c549cce..7a142bd 100644
  
          blockReader.reset();
 diff --git a/src/common/SessionConfig.cpp b/src/common/SessionConfig.cpp
-index e910617..a94cce9 100644
+index 24238d4..6c4dcc5 100644
 --- a/src/common/SessionConfig.cpp
 +++ b/src/common/SessionConfig.cpp
-@@ -108,6 +108,8 @@ SessionConfig::SessionConfig(const Config & conf) {
+@@ -112,6 +112,8 @@ SessionConfig::SessionConfig(const Config & conf) {
              &maxLocalBlockInfoCacheSize, "input.localread.blockinfo.cachesize", 1000, bind(CheckRangeGE<int32_t>, _1, _2, 1)
          }, {
              &maxReadBlockRetry, "input.read.max.retry", 60, bind(CheckRangeGE<int32_t>, _1, _2, 1)
@@ -368,7 +392,7 @@ index e910617..a94cce9 100644
              &chunkSize, "output.default.chunksize", 512, bind(CheckMultipleOf<int32_t>, _1, _2, 512)
          }, {
 diff --git a/src/common/SessionConfig.h b/src/common/SessionConfig.h
-index eb0c9ce..644544f 100644
+index 53527e4..ad05bac 100644
 --- a/src/common/SessionConfig.h
 +++ b/src/common/SessionConfig.h
 @@ -135,6 +135,14 @@ public:
@@ -386,7 +410,7 @@ index eb0c9ce..644544f 100644
      int32_t getMaxLocalBlockInfoCacheSize() const {
          return maxLocalBlockInfoCacheSize;
      }
-@@ -356,6 +364,7 @@ public:
+@@ -384,6 +392,7 @@ public:
      int32_t maxGetBlockInfoRetry;
      int32_t maxLocalBlockInfoCacheSize;
      int32_t maxReadBlockRetry;
@@ -395,5 +419,5 @@ index eb0c9ce..644544f 100644
      int32_t socketCacheCapacity;
      int32_t socketCacheExpiry;
 -- 
-2.56.0
+2.43.0
 

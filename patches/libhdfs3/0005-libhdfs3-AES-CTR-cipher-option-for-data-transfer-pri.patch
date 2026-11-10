@@ -1,7 +1,7 @@
-From 8f8d30a91aafaaf027d93e0ae97b348fa220d333 Mon Sep 17 00:00:00 2001
+From eff2d733b763cc9c45e390552a661fec73903406 Mon Sep 17 00:00:00 2001
 From: C0fuge <189659128+C0fuge@users.noreply.github.com>
 Date: Tue, 10 Nov 2026 06:49:33 +0000
-Subject: [PATCH] libhdfs3: AES/CTR cipher option for data-transfer privacy
+Subject: [PATCH 5/5] libhdfs3: AES/CTR cipher option for data-transfer privacy
  (dfs.encrypt.data.transfer.cipher.suites)
 
 With dfs.data.transfer.protection=privacy and dfs.encrypt.data.transfer.cipher.suites=AES/CTR/NoPadding
@@ -337,10 +337,10 @@ index ad2a093..5899a1b 100644
   * Socket decorator that wraps every write and unwraps every read with a negotiated DIGEST-MD5 session.
   * read() returns bytes of at most one unwrapped frame; poll(read) is true while unwrapped bytes are buffered.
 diff --git a/src/client/RemoteBlockReader.cpp b/src/client/RemoteBlockReader.cpp
-index db9e482..a175a05 100644
+index cff6b7d..93ca6c3 100644
 --- a/src/client/RemoteBlockReader.cpp
 +++ b/src/client/RemoteBlockReader.cpp
-@@ -74,7 +74,7 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+@@ -80,7 +80,7 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
      std::string qops = DataTransferProtectionToQops(conf.getDataTransferProtection());
      if (!sockFromCache && DataTransferNeedsSasl(qops, token, datanode.getXferPort())) {
          try {
@@ -350,10 +350,10 @@ index db9e482..a175a05 100644
              sock->close();
              throw;
 diff --git a/src/common/SessionConfig.cpp b/src/common/SessionConfig.cpp
-index f75a679..4c3a955 100644
+index 9afc427..94e3d42 100644
 --- a/src/common/SessionConfig.cpp
 +++ b/src/common/SessionConfig.cpp
-@@ -151,7 +151,8 @@ SessionConfig::SessionConfig(const Config & conf) {
+@@ -169,7 +169,8 @@ SessionConfig::SessionConfig(const Config & conf) {
          {&kerberosCachePath, "hadoop.security.kerberos.ticket.cache.path", "" },
          {&logSeverity, "dfs.client.log.severity", "INFO" },
          {&domainSocketPath, "dfs.domain.socket.path", ""},
@@ -364,7 +364,7 @@ index f75a679..4c3a955 100644
  
      for (size_t i = 0; i < ARRAYSIZE(boolValues); ++i) {
 diff --git a/src/common/SessionConfig.h b/src/common/SessionConfig.h
-index ec36090..90c5afc 100644
+index ac714d2..fe411b8 100644
 --- a/src/common/SessionConfig.h
 +++ b/src/common/SessionConfig.h
 @@ -159,6 +159,14 @@ public:
@@ -382,14 +382,14 @@ index ec36090..90c5afc 100644
      /*
       * OutputStream configure
       */
-@@ -378,6 +386,7 @@ public:
+@@ -406,6 +414,7 @@ public:
      int32_t socketCacheExpiry;
      std::string domainSocketPath;
      std::string dataTransferProtection;
 +    std::string dataTransferCipherSuites;
      int32_t stripeReaderThreadPoolSize;
- 
-     /*
+     bool readWriteMetricEnabled;
+     bool slowDatanodeKickoutEnabled;
 diff --git a/src/proto/datatransfer.proto b/src/proto/datatransfer.proto
 index 3de6c4b..6b74aa9 100644
 --- a/src/proto/datatransfer.proto
