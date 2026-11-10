@@ -22,7 +22,37 @@ build 42701198877, HDFS test 42702336389): patch 0007 listing cache, same settin
 queries with a glob over 4 files: cache off 20 getListing + 364 getfileinfo + 364 getBlockLocations; cache on: 1 getListing,
 0 getfileinfo, 4 getBlockLocations, all in the first query - **0 NameNode calls after the first query**.
 
-**P4 (in progress)** - see "P4 plan" below.
+**P4 (in progress)**
+
+**P4 plan** (SASL data-transfer protection, read path, libhdfs3 patches 0003+):
+- Finding 2026-11-10: libgsasl (1.10.0 and gsasl master 2026-09) DIGEST-MD5 has **no auth-conf**: the client step returns
+  an error for qop=auth-conf and `digest_md5_encode` returns -1 for it. The bdrosen96 fork's privacy path therefore cannot
+  work through gsasl (it uses gsasl_encode/decode). Even the AES cipher option needs one DIGEST-MD5 auth-conf unwrap (the
+  DataNode sends the AES keys SASL-wrapped). So we carry our own DIGEST-MD5 client.
+- Step 1 (2026-11-10): libhdfs3 **0003** `src/rpc/DigestMd5Client.{h,cpp}` (OpenSSL libcrypto only): RFC 2831 client,
+  auth / auth-int / auth-conf, ciphers 3des/des/rc4/rc4-56/rc4-40 as the JDK's DigestMD5Base, rspauth check, wrap/unwrap,
+  maxRawSendSize. Test `scripts/test-sasl.sh` + `.github/workflows/sasl-test.yml` (RFC 2831 known answer, then handshake
+  + 42 wrapped messages each way against the JDK's DIGEST-MD5 SaslServer with protocol "hdfs", server "0", for every
+  QOP/cipher, and a wrong password). Not wired in yet.
+- Step 2: wire into the read path. Protocol (Hadoop SaslDataTransferClient/Server): after connect, client writes int
+  0xDEADBEEF, then varint-delimited `DataTransferEncryptorMessageProto{status SUCCESS, payload ""}`; DataNode answers with
+  the DIGEST-MD5 challenge; client sends the response (user = base64(block token identifier), password =
+  base64(token password), digest-uri `hdfs/0`); DataNode answers with rspauth (status SUCCESS) or ERROR /
+  ERROR_UNKNOWN_KEY (message). Then for auth-int/auth-conf all bytes both ways are frames `int32 length + wrapped token`
+  (SaslInputStream/SaslOutputStream); for auth plain. Implement as a `SaslSocket : Socket` decorator (read buffers one
+  unwrapped frame; write chunks by maxRawSendSize; poll(read) true while buffered) created in RemoteBlockReader::getNextPeer
+  for new connections; do not return SASL sockets to the PeerCache (or cache the decorator). Condition (as Hadoop):
+  `dfs.data.transfer.protection` set in LIBHDFS3_CONF (authentication/integrity/privacy -> qops auth/auth-int/auth-conf,
+  comma list), block token non-empty, xfer port >= 1024; else plain. Read the config in SessionConfig.
+  Short-circuit and the write Pipeline unchanged.
+- Step 3: CI `hdfs-sasl-test.yml`: KDC container (MIT krb5, e.g. on almalinux:8), keytabs for nn/dn/HTTP + a client
+  principal, Hadoop 3.4.1 with hadoop.security.authentication=kerberos, dfs.block.access.token.enable=true,
+  dfs.data.transfer.protection=privacy, DataNode on a port >= 1024, dfs.http.policy=HTTPS_ONLY (needs a self-signed
+  keystore) - or `ignore.secure.ports.for.testing=true` to skip HTTPS; short-circuit off; a multi-block file (small
+  dfs.blocksize) read through the extension (kinit in the client container), compare with a local copy; plus the existing
+  tests. Then build afc6 and release.
+- Later/cheap: `dfs.encrypt.data.transfer` (DataEncryptionKey from getDataEncryptionKey, user = keyId/blockPoolId/nonce
+  form) and the AES cipher option (CipherOptionProto is missing from our datatransfer.proto).
 
 **P1 DONE hadoopfs-51b7220-afc4-duckdb-v1.5.6** (2026-11-09; https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc4-duckdb-v1.5.6,
 build 42643919332, HDFS test 42678080745). Server: `SET hdfs_metadata_cache_ttl_ms = <ms>` (or env `HDFS_METADATA_CACHE_TTL_MS`);

@@ -10,6 +10,7 @@ CXX=${CXX:-g++}
 log "build digestmd5_test"
 $CXX -std=c++11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I src/src/rpc "$HERE/tests/libhdfs3/digestmd5_test.cpp" \
   src/src/rpc/DigestMd5Client.cpp -lcrypto -o digestmd5_test
+export ASAN_OPTIONS=detect_leaks=0   # OpenSSL keeps global RAND/provider state until exit
 ./digestmd5_test kat
 java -version 2>&1 | head -1
 U='AAEAAAGQbG9ja3Rva2VuLWlk/w=='; P='c2VjcmV0LWJsb2NrLXRva2VuLXBhc3N3b3Jk'   # base64 like a block token
