@@ -17,9 +17,15 @@ conf() { # conf <file> <protection or ''>
 }
 conf /tmp/privacy.xml privacy
 conf /tmp/plain.xml ''
+sed 's|</configuration>|<property><name>dfs.client.log.severity</name><value>DEBUG1</value></property></configuration>|' /tmp/privacy.xml > /tmp/debug.xml
 Q="SELECT count(*), sum(id), sum(v), count(DISTINCT s) FROM read_parquet('hdfs://localhost:8020/t/big.parquet')"
 want=$($D -csv -noheader -c "${Q/hdfs:\/\/localhost:8020\/t/data};")
 echo "local:   $want"
+# first contact with libhdfs3 debug log + Kerberos trace, shown on failure
+if ! LIBHDFS3_CONF=/tmp/debug.xml KRB5_TRACE=/tmp/krb5.trace $D -unsigned -csv -noheader -c "LOAD '$EXT';
+     SELECT count(*) FROM read_parquet('hdfs://localhost:8020/t/big.parquet');" > /tmp/debug.out 2>&1; then
+  tail -c 6000 /tmp/debug.out; echo "--- krb5 trace"; tail -c 4000 /tmp/krb5.trace || true; exit 1
+fi
 for ttl in 0 600000; do
   got=$(LIBHDFS3_CONF=/tmp/privacy.xml $D -unsigned -csv -noheader -c "LOAD '$EXT'; SET hdfs_metadata_cache_ttl_ms = $ttl; $Q;")
   echo "privacy (ttl $ttl): $got"
