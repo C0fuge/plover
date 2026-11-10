@@ -34,23 +34,20 @@ queries with a glob over 4 files: cache off 20 getListing + 364 getfileinfo + 36
   maxRawSendSize. Test `scripts/test-sasl.sh` + `.github/workflows/sasl-test.yml` (RFC 2831 known answer, then handshake
   + 39 wrapped messages each way (1 B .. 65000 B) against the JDK's DIGEST-MD5 SaslServer with protocol "hdfs", server "0", for every
   QOP/cipher, and a wrong password). Not wired in yet.
-- Step 2: wire into the read path. Protocol (Hadoop SaslDataTransferClient/Server): after connect, client writes int
-  0xDEADBEEF, then varint-delimited `DataTransferEncryptorMessageProto{status SUCCESS, payload ""}`; DataNode answers with
-  the DIGEST-MD5 challenge; client sends the response (user = base64(block token identifier), password =
-  base64(token password), digest-uri `hdfs/0`); DataNode answers with rspauth (status SUCCESS) or ERROR /
-  ERROR_UNKNOWN_KEY (message). Then for auth-int/auth-conf all bytes both ways are frames `int32 length + wrapped token`
-  (SaslInputStream/SaslOutputStream); for auth plain. Implement as a `SaslSocket : Socket` decorator (read buffers one
-  unwrapped frame; write chunks by maxRawSendSize; poll(read) true while buffered) created in RemoteBlockReader::getNextPeer
-  for new connections; do not return SASL sockets to the PeerCache (or cache the decorator). Condition (as Hadoop):
-  `dfs.data.transfer.protection` set in LIBHDFS3_CONF (authentication/integrity/privacy -> qops auth/auth-int/auth-conf,
-  comma list), block token non-empty, xfer port >= 1024; else plain. Read the config in SessionConfig.
-  Short-circuit and the write Pipeline unchanged.
-- Step 3: CI `hdfs-sasl-test.yml`: KDC container (MIT krb5, e.g. on almalinux:8), keytabs for nn/dn/HTTP + a client
-  principal, Hadoop 3.4.1 with hadoop.security.authentication=kerberos, dfs.block.access.token.enable=true,
-  dfs.data.transfer.protection=privacy, DataNode on a port >= 1024, dfs.http.policy=HTTPS_ONLY (needs a self-signed
-  keystore) - or `ignore.secure.ports.for.testing=true` to skip HTTPS; short-circuit off; a multi-block file (small
-  dfs.blocksize) read through the extension (kinit in the client container), compare with a local copy; plus the existing
-  tests. Then build afc6 and release.
+- Step 2 (2026-11-10, written, CI pending): libhdfs3 **0004** `src/client/DataTransferSasl.{h,cpp}` + RemoteBlockReader +
+  SessionConfig `dfs.data.transfer.protection`. Protocol as Hadoop SaslDataTransferClient: int 0xDEADBEEF, varint-delimited
+  `DataTransferEncryptorMessageProto{SUCCESS, payload ""}`, challenge, response (user base64(token identifier), password
+  base64(token password), digest-uri `hdfs/0`), rspauth; ERROR / ERROR_UNKNOWN_KEY -> HdfsIOException (next replica).
+  auth-int/auth-conf: `SaslSocket : Socket` decorator, frames `int32 length + token` both ways (writes chunked by
+  maxRawSendSize, poll(read) true while unwrapped bytes are buffered); only new connections do the handshake, pooled
+  ones are the SaslSocket already. Used when protection set + block token non-empty + xfer port >= 1024.
+- Step 3 (2026-11-10, written, CI pending): `.github/workflows/hdfs-sasl-test.yml` + `tests/hdfs-sasl/` (kdc.sh: MIT KDC
+  in almalinux:8, realm EXAMPLE.TEST, principals nn/dn/HTTP@localhost + client, keytabs and ccaches in ./krb; start.sh:
+  Hadoop 3.4.1 with kerberos, block tokens, `dfs.data.transfer.protection=privacy`, DataNode 9866,
+  `ignore.secure.ports.for.testing=true` (no HTTPS needed), webhdfs off; run.sh: kinit, LIBHDFS3_CONF with
+  hadoop.security.authentication=kerberos + protection privacy, full scan + point reads of an 11-block file (1 MB blocks)
+  vs the local file, cache off/on; negative check: without the client setting the read must fail).
+  Expect a few iterations on the Kerberos container setup (principal/hostname canonicalization, ccache permissions).
 - Later/cheap: `dfs.encrypt.data.transfer` (DataEncryptionKey from getDataEncryptionKey, user = keyId/blockPoolId/nonce
   form) and the AES cipher option (CipherOptionProto is missing from our datatransfer.proto).
 
