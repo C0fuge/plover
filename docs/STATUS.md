@@ -5,10 +5,24 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
-> **Maintainer, 2026-11-10 11:25 - check first:** the real cluster's DataNodes use `dfs.data.transfer.protection =
+> **Maintainer, 2026-11-10 11:25 - check first (DONE, session (4) below):** the real cluster's DataNodes use `dfs.data.transfer.protection =
 > authentication,privacy` (several QOPs, client and DataNode negotiate). Add that value to the SASL HDFS test (DataNode
 > side `authentication,privacy`, client side the same and also `privacy` only / `authentication` only) and fix the
 > negotiation if needed; release the fix as the next afc build.
+
+> **Session 2026-11-10 (4): multi-QOP `authentication,privacy` checked - works with afc8 as it is, no fix needed, no new
+> build (afc8 stays current).** SASL HDFS test 42785434422 (afc8 build 42777872495, 3 DataNodes with
+> `dfs.data.transfer.protection=authentication,privacy` + AES suites, failover included): every client setting reads
+> correctly (full scan, point reads, metadata cache off/on). Negotiated as Hadoop's own client does it - **the first QOP
+> of the CLIENT's list that the DataNode offers**: client `authentication,privacy` -> **auth (no encryption)**;
+> `privacy,authentication` -> auth-conf (3des, or AES/CTR with the cipher suites set); `privacy` -> auth-conf / AES;
+> `authentication` -> auth; a client without the setting is refused. Throughput on a 147 MB scan, one runner:
+> 3des 23-26 MB/s, AES 168-185 MB/s, auth 271-279 MB/s (local file 544 MB/s). **For the server:** to get encryption
+> against these DataNodes put `privacy` (or `privacy,authentication`) + `dfs.encrypt.data.transfer.cipher.suites=AES/CTR/NoPadding`
+> into LIBHDFS3_CONF; `authentication,privacy` on the client means auth only (fastest, block token authenticated, data
+> not encrypted). Regression: privacy-only DataNodes 42785442912 OK (an authentication-only client is refused there),
+> JDK interop 42785438826 OK (new cases: server auth,auth-conf with each client order). Remaining candidates, only on
+> request: as in session (3) below.
 
 > **Session 2026-11-10 (3): item (1) pin bump done - afc8 released (https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc8-duckdb-v1.5.6); nothing open from the maintainer's list.**
 > libhdfs3 pin 94a9ead -> 85dabf0 (master 2026-11-05: c5dc2bd/c67cd2e slow-DataNode avoidance, d9c26dc malformed
@@ -240,6 +254,8 @@ block reader (`HdfsTimeoutException`, e.g. a pooled socket to a silently lost Da
   12.2 s with SET 3 s), v1.4.1 build -> `TProtocolException: Invalid data` after 3.1 s (another short-read symptom).
 
 ## Open
+- 2026-11-10: maintainer item multi-QOP: test-only change (dn_protection input, client QOP matrix, auth throughput,
+  JDK interop cases); afc8 passes all (42785434422, 42785442912, 42785438826) on the first try; no fix, no new release.
 - 2026-11-10: item (1) pin bump: libhdfs3 94a9ead -> 85dabf0, patches rebased (0001 merged with SlowNodeTracker in
   choseBestNode), afc8 build 42777872495 + all tests green on the first try; released afc8.
 - 2026-11-10: item (2) AES done: libhdfs3 0005, afc7 build 42771355611, SASL test 42772691546 (first run 42772097200 failed
