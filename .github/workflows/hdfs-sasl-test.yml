@@ -20,6 +20,9 @@ on:
         type: choice
         options: [authentication, integrity, privacy]
         default: authentication
+      dn_protection:
+        description: dfs.data.transfer.protection of the DataNodes (several QOPs, e.g. authentication,privacy, also test the client's QOP choice)
+        default: privacy
       cipher_suites:
         description: dfs.encrypt.data.transfer.cipher.suites of the DataNodes ("" = off); the tests then also read with the AES/CTR option and compare throughput 3des vs AES
         default: AES/CTR/NoPadding
@@ -31,6 +34,7 @@ jobs:
     env:
       DATANODES: ${{ inputs.datanodes }}
       RPC_PROTECTION: ${{ inputs.rpc_protection }}
+      DN_PROTECTION: ${{ inputs.dn_protection }}
       CIPHER_SUITES: ${{ inputs.cipher_suites }}
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +66,7 @@ jobs:
       - name: test (AlmaLinux 8 container = the extension's runtime libs)
         run: |
           docker run --name tc -d --network host -v "$PWD:/w" -w /w -e DUCKDB_VERSION=${{ inputs.duckdb_version }} \
-            -e DATANODES -e CIPHER_SUITES almalinux:8 sleep infinity
+            -e DATANODES -e CIPHER_SUITES -e DN_PROTECTION almalinux:8 sleep infinity
           docker exec tc bash tests/hdfs-sasl/run.sh
       - name: failover test (kill DataNodes between and during scans)
         if: inputs.datanodes >= 3

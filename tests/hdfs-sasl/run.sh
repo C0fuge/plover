@@ -3,6 +3,9 @@
 # with dfs.data.transfer.protection=privacy through the extension (libhdfs3 patches 0003/0004); short-circuit off.
 # With CIPHER_SUITES (default AES/CTR/NoPadding, as start.sh) also with the AES/CTR cipher option (libhdfs3 0005), and,
 # when the failover file exists (3 DataNodes), a throughput comparison 3des vs AES on full scans.
+# DN_PROTECTION (default privacy, as start.sh): the DataNodes' dfs.data.transfer.protection. When it offers several QOPs
+# (e.g. "authentication,privacy") the client is also run with "authentication,privacy", "privacy,authentication" and
+# "authentication" and must negotiate what Hadoop's client does: the first QOP of the CLIENT's list the DataNode offers.
 set -euo pipefail
 dnf install -y -q libxml2 krb5-libs krb5-workstation libuuid openssl-libs >/dev/null
 D=$PWD/duckdb; EXT=$PWD/ext/hadoopfs.duckdb_extension
@@ -26,6 +29,42 @@ debug /tmp/privacy.xml /tmp/debug.xml
 CONFS=/tmp/privacy.xml
 if [ -n "$CIPHER" ]; then
   conf /tmp/aes.xml privacy "$CIPHER"; debug /tmp/aes.xml /tmp/debug-aes.xml; CONFS="$CONFS /tmp/aes.xml"
+fi
+DNP=${DN_PROTECTION:-privacy}
+echo "DataNodes: dfs.data.transfer.protection=$DNP"
+# check_qop <conf> <want qop>: every DataNode connection of a scan negotiated <want qop> (debug log)
+check_qop() {
+  debug "$1" /tmp/dbg-q.xml
+  if ! HDFS_ENABLE_LOGGING=true LIBHDFS3_CONF=/tmp/dbg-q.xml $D -unsigned -csv -noheader -c "LOAD '$EXT';
+       SELECT count(*) FROM read_parquet('hdfs://localhost:8020/t/big.parquet');" > /tmp/dbg-q.out 2>&1; then
+    tail -c 6000 /tmp/dbg-q.out; echo "FAIL: read with $(basename "$1" .xml)"; exit 1
+  fi
+  local n bad
+  n=$(grep -c "DataTransferSasl: DataNode .*: qop " /tmp/dbg-q.out || true)
+  bad=$(grep "DataTransferSasl: DataNode .*: qop " /tmp/dbg-q.out | grep -v ": qop $2," | head -3 || true)
+  [ "$n" -gt 0 ] && [ -z "$bad" ] || { echo "$bad"; echo "FAIL: $(basename "$1" .xml): want qop $2 on all $n connections"; exit 1; }
+  echo "$(basename "$1" .xml): $n connections, qop $2: $(grep -m1 "DataTransferSasl: DataNode .*: qop " /tmp/dbg-q.out | sed 's/.*DataTransferSasl: //')"
+}
+if [[ ",$DNP," == *",authentication,"* ]]; then
+  conf /tmp/authpriv.xml "authentication,privacy"; check_qop /tmp/authpriv.xml auth
+  conf /tmp/privauth.xml "privacy,authentication"; check_qop /tmp/privauth.xml auth-conf
+  conf /tmp/auth.xml authentication; check_qop /tmp/auth.xml auth
+  CONFS="$CONFS /tmp/authpriv.xml /tmp/privauth.xml /tmp/auth.xml"
+  if [ -n "$CIPHER" ]; then  # cipher option offered, but auth negotiated: the DataNode sends no keys, stream stays plain
+    conf /tmp/authpriv-aes.xml "authentication,privacy" "$CIPHER"; check_qop /tmp/authpriv-aes.xml auth
+    conf /tmp/privauth-aes.xml "privacy,authentication" "$CIPHER"; check_qop /tmp/privauth-aes.xml auth-conf
+    grep -q "cipher option AES/CTR/NoPadding" /tmp/dbg-q.out || { echo "FAIL: privacy,authentication + AES: AES not negotiated"; exit 1; }
+    CONFS="$CONFS /tmp/authpriv-aes.xml /tmp/privauth-aes.xml"
+  fi
+else
+  # the DataNodes do not offer auth: an authentication-only client must be refused
+  conf /tmp/auth.xml authentication
+  if LIBHDFS3_CONF=/tmp/auth.xml timeout 120 $D -unsigned -csv -noheader -c "LOAD '$EXT'; SET hdfs_read_timeout_ms = 5000;
+       SELECT count(*) FROM read_parquet('hdfs://localhost:8020/t/big.parquet');" > /tmp/auth.out 2>&1; then
+    cat /tmp/auth.out; echo "FAIL: authentication-only client read from $DNP DataNodes"; exit 1
+  fi
+  echo "authentication-only client refused: $(head -c 300 /tmp/auth.out)"
+  rm -f /tmp/auth.xml
 fi
 Q="SELECT count(*), sum(id), sum(v), count(DISTINCT s) FROM read_parquet('hdfs://localhost:8020/t/big.parquet')"
 want=$($D -csv -noheader -c "${Q/hdfs:\/\/localhost:8020\/t/data};")
@@ -75,12 +114,12 @@ if [ -n "$CIPHER" ] && [ -f data/fo.parquet ]; then
   t0=$(date +%s.%N); $D -csv -noheader -c "${QF/hdfs:\/\/localhost:8020\/t/data};" >/dev/null; t1=$(date +%s.%N)
   echo "throughput local file: $(awk -v s=$size -v a=$t0 -v b=$t1 'BEGIN{printf "%.2f s, %.1f MB/s", b-a, s/(b-a)/1e6}')"
   for round in 1 2 3; do
-    for c in /tmp/privacy.xml /tmp/aes.xml; do
+    for c in /tmp/privacy.xml /tmp/aes.xml $( [ -f /tmp/auth.xml ] && echo /tmp/auth.xml ); do
       t0=$(date +%s.%N)
       got=$(LIBHDFS3_CONF=$c $D -unsigned -csv -noheader -c "LOAD '$EXT'; $QF;")
       t1=$(date +%s.%N)
       [ "$got" = "$wantf" ] || { echo "FAIL: fo.parquet result differs ($c)"; exit 1; }
-      echo "throughput round $round $( [ $c = /tmp/aes.xml ] && echo AES || echo 3des): $(awk -v s=$size -v a=$t0 -v b=$t1 'BEGIN{printf "%.2f s, %.1f MB/s", b-a, s/(b-a)/1e6}') ($size bytes)"
+      echo "throughput round $round $(case $c in /tmp/aes.xml) echo AES;; /tmp/auth.xml) echo "auth (no wrap)";; *) echo 3des;; esac): $(awk -v s=$size -v a=$t0 -v b=$t1 'BEGIN{printf "%.2f s, %.1f MB/s", b-a, s/(b-a)/1e6}') ($size bytes)"
     done
   done
 fi

@@ -3,6 +3,7 @@
 # short-circuit off, 1 MB blocks allowed. Host network; KDC from kdc.sh.
 # DATANODES (default 1): containers dn1..dnN, DataNode i on xfer port 9866+10*(i-1) (http 9864+.., ipc 9867+..);
 # replication min(2, N). RPC_PROTECTION (default authentication): hadoop.rpc.protection of the cluster.
+# DN_PROTECTION (default privacy): dfs.data.transfer.protection of the cluster, e.g. "authentication,privacy".
 # CIPHER_SUITES (default AES/CTR/NoPadding, "" = off): dfs.encrypt.data.transfer.cipher.suites of the DataNodes (a client
 # that does not offer the cipher option still gets DIGEST-MD5 3des wrapping, so one cluster serves both).
 set -euo pipefail
@@ -10,6 +11,7 @@ IMG=apache/hadoop:3.4.1
 R=EXAMPLE.TEST
 N=${DATANODES:-1}
 RPC=${RPC_PROTECTION:-authentication}
+DNP=${DN_PROTECTION:-privacy}
 CIPHER=${CIPHER_SUITES-AES/CTR/NoPadding}
 REPL=$(( N < 2 ? N : 2 ))
 docker pull -q almalinux:8 >/dev/null; docker pull -q $IMG >/dev/null
@@ -27,7 +29,7 @@ CONF=(-e "CORE-SITE.XML_fs.defaultFS=hdfs://localhost:8020"
       -e "HDFS-SITE.XML_dfs.namenode.safemode.extension=0"
       -e "HDFS-SITE.XML_dfs.namenode.fs-limits.min-block-size=65536"
       -e "HDFS-SITE.XML_dfs.block.access.token.enable=true"
-      -e "HDFS-SITE.XML_dfs.data.transfer.protection=privacy"
+      -e "HDFS-SITE.XML_dfs.data.transfer.protection=$DNP"
       -e "HDFS-SITE.XML_ignore.secure.ports.for.testing=true"
       -e "HDFS-SITE.XML_dfs.webhdfs.enabled=false"
       -e "HDFS-SITE.XML_dfs.namenode.kerberos.principal=nn/localhost@$R"
@@ -48,7 +50,7 @@ done
 FSN="http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=FSNamesystemState"
 for i in $(seq 1 60); do
   live=$(curl -sf "$FSN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["beans"][0]["NumLiveDataNodes"])' 2>/dev/null || echo 0)
-  if [ "$live" -ge "$N" ]; then echo "secure HDFS up ($N DataNodes, replication $REPL, rpc $RPC, cipher suites ${CIPHER:-none}) after ${i}x2 s"; exit 0; fi
+  if [ "$live" -ge "$N" ]; then echo "secure HDFS up ($N DataNodes, replication $REPL, rpc $RPC, data transfer $DNP, cipher suites ${CIPHER:-none}) after ${i}x2 s"; exit 0; fi
   sleep 2
 done
 curl -s "$FSN" || true; docker logs nn 2>&1 | tail -60; for i in $(seq 1 "$N"); do docker logs dn$i 2>&1 | tail -40; done; exit 1

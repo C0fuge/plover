@@ -30,6 +30,11 @@ for c in rc4 des rc4-56 rc4-40; do run_case auth-conf auth-conf $c auth-conf $c 
 run_case auth-conf,auth-int,auth auth-int,auth auth auth-int - || fail=1
 run_case auth-conf,auth-int,auth auth auth auth - || fail=1
 run_case auth-int,auth auth-conf,auth-int auth auth-int - || fail=1
+# DataNode dfs.data.transfer.protection=authentication,privacy (server offers auth,auth-conf): the client's order decides
+run_case auth,auth-conf auth,auth-conf 3des,rc4,des,rc4-56,rc4-40 auth - || fail=1
+run_case auth,auth-conf auth-conf,auth 3des,rc4,des,rc4-56,rc4-40 auth-conf 3des || fail=1
+run_case auth,auth-conf auth-conf 3des,rc4,des,rc4-56,rc4-40 auth-conf 3des || fail=1
+run_case auth,auth-conf auth 3des,rc4,des,rc4-56,rc4-40 auth - || fail=1
 # wrong password: both sides must fail
 if run_case auth-conf auth-conf 3des auth-conf 3des d3JvbmctcGFzc3dvcmQ= >/dev/null 2>&1; then echo "wrong password accepted"; fail=1
 else echo "--- wrong password rejected: OK"; fi
