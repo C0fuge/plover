@@ -5,6 +5,10 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+> **Maintainer, 2026-11-10 10:15:** rpc privacy -> (B), leave it: the target cluster works with the current extension,
+> so its `hadoop.rpc.protection` is authentication. Go on with AES (3des at 18-24 MB/s per scan is too slow for the
+> server's direct SASL reads; target: within ~20 % of a plain read).
+
 > **Session 2026-11-10 (2): item (5) done for `hadoop.rpc.protection=authentication`; `privacy` is BLOCKED in libhdfs3 -
 > your decision needed.** Test run 42766835989 (afc6 build 42753149137, 3 DataNodes, replication 2, data transfer privacy,
 > metadata cache on, DuckDB external file cache off, one DuckDB process): 140 MB / 35-block file, blocks served by all 3
