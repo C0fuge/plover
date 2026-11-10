@@ -2,7 +2,7 @@ name: hdfs sasl test (Kerberos, data transfer privacy)
 
 # Runs a build's extension against a Kerberized HDFS 3.4.1 (KDC + namenode + 1..3 datanode containers, host network)
 # with dfs.data.transfer.protection=privacy on non-privileged DataNode ports; reads a multi-block file. With 3
-# DataNodes (replication 2) also the failover test: a DataNode killed between scans and mid-scan, metadata cache on.
+# DataNodes (replication 2) also the failover test and a 3des vs AES/CTR throughput comparison: a DataNode killed between scans and mid-scan, metadata cache on.
 on:
   workflow_dispatch:
     inputs:
@@ -20,6 +20,9 @@ on:
         type: choice
         options: [authentication, integrity, privacy]
         default: authentication
+      cipher_suites:
+        description: dfs.encrypt.data.transfer.cipher.suites of the DataNodes ("" = off); the tests then also read with the AES/CTR option and compare throughput 3des vs AES
+        default: AES/CTR/NoPadding
 
 jobs:
   hdfs-sasl:
@@ -28,6 +31,7 @@ jobs:
     env:
       DATANODES: ${{ inputs.datanodes }}
       RPC_PROTECTION: ${{ inputs.rpc_protection }}
+      CIPHER_SUITES: ${{ inputs.cipher_suites }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -58,7 +62,7 @@ jobs:
       - name: test (AlmaLinux 8 container = the extension's runtime libs)
         run: |
           docker run --name tc -d --network host -v "$PWD:/w" -w /w -e DUCKDB_VERSION=${{ inputs.duckdb_version }} \
-            -e DATANODES almalinux:8 sleep infinity
+            -e DATANODES -e CIPHER_SUITES almalinux:8 sleep infinity
           docker exec tc bash tests/hdfs-sasl/run.sh
       - name: failover test (kill DataNodes between and during scans)
         if: inputs.datanodes >= 3

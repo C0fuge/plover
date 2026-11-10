@@ -1,0 +1,435 @@
+From 8f8d30a91aafaaf027d93e0ae97b348fa220d333 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 06:49:33 +0000
+Subject: [PATCH] libhdfs3: AES/CTR cipher option for data-transfer privacy
+ (dfs.encrypt.data.transfer.cipher.suites)
+
+With dfs.data.transfer.protection=privacy and dfs.encrypt.data.transfer.cipher.suites=AES/CTR/NoPadding
+the client offers an AES/CTR CipherOptionProto with its DIGEST-MD5 response (as SaslDataTransferClient).
+If the DataNode accepts it, its keys are unwrapped with the auth-conf session and the connection
+continues as a plain AES-CTR stream (AesCtrSocket) instead of DIGEST-MD5 3des frames.
+---
+ src/client/DataTransferSasl.cpp  | 182 +++++++++++++++++++++++++++++--
+ src/client/DataTransferSasl.h    |  48 +++++++-
+ src/client/RemoteBlockReader.cpp |   2 +-
+ src/common/SessionConfig.cpp     |   3 +-
+ src/common/SessionConfig.h       |   9 ++
+ src/proto/datatransfer.proto     |  22 ++++
+ 6 files changed, 255 insertions(+), 11 deletions(-)
+
+diff --git a/src/client/DataTransferSasl.cpp b/src/client/DataTransferSasl.cpp
+index 0ea6eff..87a9d85 100644
+--- a/src/client/DataTransferSasl.cpp
++++ b/src/client/DataTransferSasl.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include "Exception.h"
+ #include "ExceptionInternal.h"
++#include "Logger.h"
+ #include "Token.h"
+ #include "WriteBuffer.h"
+ #include "datatransfer.pb.h"
+@@ -77,10 +78,15 @@ bool DataTransferNeedsSasl(const std::string & qops, const Token & blockToken, i
+     return !qops.empty() && !blockToken.getIdentifier().empty() && xferPort >= 1024;
+ }
+ 
+-static void SendSaslMessage(Socket & sock, const std::string & payload, int writeTimeout) {
++static const char AES_CTR_NOPADDING_NAME[] = "AES/CTR/NoPadding";
++
++static void SendSaslMessage(Socket & sock, const std::string & payload, int writeTimeout, bool offerAes = false) {
+     DataTransferEncryptorMessageProto msg;
+     msg.set_status(DataTransferEncryptorMessageProto_DataTransferEncryptorStatus_SUCCESS);
+     msg.set_payload(payload);
++    if (offerAes) {
++        msg.add_cipheroption()->set_suite(AES_CTR_NOPADDING);
++    }
+     WriteBuffer buffer;
+     int size = msg.ByteSize();
+     buffer.writeVarint32(size);
+@@ -91,7 +97,8 @@ static void SendSaslMessage(Socket & sock, const std::string & payload, int writ
+     sock.writeFully(buffer.getBuffer(0), buffer.getDataSize(0), writeTimeout);
+ }
+ 
+-static std::string ReadSaslMessage(Socket & sock, int readTimeout, const std::string & datanode) {
++static void ReadSaslMessage(Socket & sock, int readTimeout, const std::string & datanode,
++                            DataTransferEncryptorMessageProto & msg) {
+     uint32_t size = 0;
+     for (int shift = 0;; shift += 7) {
+         unsigned char c;
+@@ -110,7 +117,6 @@ static std::string ReadSaslMessage(Socket & sock, int readTimeout, const std::st
+     }
+     std::vector<char> buf(size);
+     sock.readFully(&buf[0], size, readTimeout);
+-    DataTransferEncryptorMessageProto msg;
+     if (!msg.ParseFromArray(&buf[0], size)) {
+         THROW(HdfsIOException, "DataTransferSasl: cannot parse the SASL message from DataNode %s", datanode.c_str());
+     }
+@@ -121,14 +127,28 @@ static std::string ReadSaslMessage(Socket & sock, int readTimeout, const std::st
+         THROW(HdfsIOException, "DataTransferSasl: DataNode %s refused the SASL handshake: %s", datanode.c_str(),
+               msg.message().c_str());
+     }
++}
++
++static std::string ReadSaslMessage(Socket & sock, int readTimeout, const std::string & datanode) {
++    DataTransferEncryptorMessageProto msg;
++    ReadSaslMessage(sock, readTimeout, datanode, msg);
+     return msg.payload();
+ }
+ 
+ shared_ptr<Socket> DataTransferSaslConnect(shared_ptr<Socket> sock, const Token & blockToken,
+-                                           const std::string & qops, int readTimeout, int writeTimeout,
+-                                           const std::string & datanode) {
++                                           const std::string & qops, const std::string & cipherSuites,
++                                           int readTimeout, int writeTimeout, const std::string & datanode) {
++    std::string suites(cipherSuites);
++    suites.erase(0, suites.find_first_not_of(" \t"));
++    suites.erase(suites.find_last_not_of(" \t") + 1);
++    if (!suites.empty() && suites != AES_CTR_NOPADDING_NAME) {
++        THROW(HdfsIOException, "unsupported dfs.encrypt.data.transfer.cipher.suites \"%s\" (only %s)", suites.c_str(),
++              AES_CTR_NOPADDING_NAME);
++    }
+     shared_ptr<DigestMd5Client> sasl(new DigestMd5Client(Base64(blockToken.getIdentifier()),
+                                                          Base64(blockToken.getPassword()), "hdfs", "0", qops));
++    DataTransferEncryptorMessageProto last;
++    std::string inKey, outKey;
+     try {
+         char magic[4];
+         magic[0] = (SASL_TRANSFER_MAGIC_NUMBER >> 24) & 0xff;
+@@ -138,21 +158,167 @@ shared_ptr<Socket> DataTransferSaslConnect(shared_ptr<Socket> sock, const Token
+         sock->writeFully(magic, 4, writeTimeout);
+         SendSaslMessage(*sock, std::string(), writeTimeout);
+         std::string challenge = ReadSaslMessage(*sock, readTimeout, datanode);
+-        SendSaslMessage(*sock, sasl->evaluateChallenge(challenge), writeTimeout);
+-        std::string rspauth = ReadSaslMessage(*sock, readTimeout, datanode);
+-        sasl->evaluateChallenge(rspauth);
++        std::string response = sasl->evaluateChallenge(challenge);
++        // as SaslDataTransferClient: the cipher option goes with the response when privacy was requested
++        bool offerAes = !suites.empty() && qops.find("auth-conf") != std::string::npos;
++        SendSaslMessage(*sock, response, writeTimeout, offerAes);
++        ReadSaslMessage(*sock, readTimeout, datanode, last);
++        sasl->evaluateChallenge(last.payload());
++        if (sasl->isComplete() && sasl->qop() == "auth-conf" && last.cipheroption_size() > 0) {
++            const CipherOptionProto & opt = last.cipheroption(0);
++            if (opt.suite() != AES_CTR_NOPADDING) {
++                THROW(HdfsIOException, "DataTransferSasl: DataNode %s chose an unsupported cipher suite %d",
++                      datanode.c_str(), static_cast<int>(opt.suite()));
++            }
++            // the DataNode wraps inKey, then outKey (DataTransferSaslUtil.wrap): unwrap in that order
++            if (opt.has_inkey()) {
++                inKey = sasl->unwrap(opt.inkey().data(), opt.inkey().size());
++            }
++            if (opt.has_outkey()) {
++                outKey = sasl->unwrap(opt.outkey().data(), opt.outkey().size());
++            }
++        }
+     } catch (const DigestMd5Error & e) {
+         THROW(HdfsIOException, "DataTransferSasl: SASL handshake with DataNode %s failed: %s", datanode.c_str(), e.what());
+     }
+     if (!sasl->isComplete()) {
+         THROW(HdfsIOException, "DataTransferSasl: SASL handshake with DataNode %s did not complete", datanode.c_str());
+     }
++    if (sasl->qop() == "auth-conf" && last.cipheroption_size() > 0) {
++        const CipherOptionProto & opt = last.cipheroption(0);
++        LOG(DEBUG1, "DataTransferSasl: DataNode %s: qop auth-conf, cipher option AES/CTR/NoPadding, key %d bits",
++            datanode.c_str(), static_cast<int>(outKey.size() * 8));
++        return shared_ptr<Socket>(new AesCtrSocket(sock, inKey, opt.iniv(), outKey, opt.outiv(), writeTimeout,
++                                                   datanode));
++    }
++    LOG(DEBUG1, "DataTransferSasl: DataNode %s: qop %s, cipher %s", datanode.c_str(), sasl->qop().c_str(),
++        sasl->cipher().empty() ? "-" : sasl->cipher().c_str());
+     if (!sasl->isWrapping()) {
+         return sock;
+     }
+     return shared_ptr<Socket>(new SaslSocket(sock, sasl, readTimeout, datanode));
+ }
+ 
++static const EVP_CIPHER * AesCtrCipher(size_t keyLen) {
++    switch (keyLen) {
++    case 16:
++        return EVP_aes_128_ctr();
++    case 24:
++        return EVP_aes_192_ctr();
++    case 32:
++        return EVP_aes_256_ctr();
++    default:
++        return NULL;
++    }
++}
++
++static EVP_CIPHER_CTX * NewAesCtr(const std::string & key, const std::string & iv, const std::string & datanode) {
++    const EVP_CIPHER * cipher = AesCtrCipher(key.size());
++    if (!cipher || iv.size() != 16) {
++        THROW(HdfsIOException, "DataTransferSasl: DataNode %s sent an AES/CTR option with key length %d, IV length %d",
++              datanode.c_str(), static_cast<int>(key.size()), static_cast<int>(iv.size()));
++    }
++    EVP_CIPHER_CTX * ctx = EVP_CIPHER_CTX_new();
++    if (!ctx || EVP_EncryptInit_ex(ctx, cipher, NULL, reinterpret_cast<const unsigned char *>(key.data()),
++                                   reinterpret_cast<const unsigned char *>(iv.data())) != 1) {
++        EVP_CIPHER_CTX_free(ctx);
++        THROW(HdfsIOException, "DataTransferSasl: cannot set up AES/CTR for DataNode %s", datanode.c_str());
++    }
++    return ctx;
++}
++
++AesCtrSocket::AesCtrSocket(shared_ptr<Socket> raw, const std::string & encKey, const std::string & encIv,
++                           const std::string & decKey, const std::string & decIv, int writeTimeout,
++                           const std::string & datanode)
++    : raw(raw), enc(NULL), dec(NULL), datanode(datanode), writeTimeout(writeTimeout) {
++    enc = NewAesCtr(encKey, encIv, datanode);
++    try {
++        dec = NewAesCtr(decKey, decIv, datanode);
++    } catch (...) {
++        EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX *>(enc));
++        throw;
++    }
++}
++
++AesCtrSocket::~AesCtrSocket() {
++    EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX *>(enc));
++    EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX *>(dec));
++}
++
++void AesCtrSocket::crypt(void * ctx, const char * in, char * out, int32_t size) {
++    int outl = 0;
++    if (size > 0 && (EVP_EncryptUpdate(static_cast<EVP_CIPHER_CTX *>(ctx), reinterpret_cast<unsigned char *>(out),
++                                       &outl, reinterpret_cast<const unsigned char *>(in), size) != 1 ||
++                     outl != size)) {
++        THROW(HdfsIOException, "AesCtrSocket: AES/CTR failed (DataNode %s)", datanode.c_str());
++    }
++}
++
++int32_t AesCtrSocket::read(char * buffer, int32_t size) {
++    int32_t n = raw->read(buffer, size);
++    if (n > 0) {
++        crypt(dec, buffer, buffer, n);
++    }
++    return n;
++}
++
++void AesCtrSocket::readFully(char * buffer, int32_t size, int timeout) {
++    // a timeout/error in the middle leaves the stream unusable anyway (the caller drops the connection)
++    raw->readFully(buffer, size, timeout);
++    crypt(dec, buffer, buffer, size);
++}
++
++int32_t AesCtrSocket::write(const char * buffer, int32_t size) {
++    // the cipher stream advances on encryption: write all or nothing
++    writeFully(buffer, size, writeTimeout);
++    return size;
++}
++
++void AesCtrSocket::writeFully(const char * buffer, int32_t size, int timeout) {
++    if (size <= 0) {
++        return;
++    }
++    wbuf.resize(size);
++    crypt(enc, buffer, &wbuf[0], size);
++    raw->writeFully(&wbuf[0], size, timeout);
++}
++
++void AesCtrSocket::connect(const char *, int, int) {
++    THROW(HdfsIOException, "AesCtrSocket: connect on an encrypted socket");
++}
++
++void AesCtrSocket::connect(const char *, const char *, int) {
++    THROW(HdfsIOException, "AesCtrSocket: connect on an encrypted socket");
++}
++
++void AesCtrSocket::connect(struct addrinfo *, const char *, const char *, int) {
++    THROW(HdfsIOException, "AesCtrSocket: connect on an encrypted socket");
++}
++
++bool AesCtrSocket::poll(bool read, bool write, int timeout) {
++    return raw->poll(read, write, timeout);
++}
++
++void AesCtrSocket::setBlockMode(bool enable) {
++    raw->setBlockMode(enable);
++}
++
++void AesCtrSocket::setNoDelay(bool enable) {
++    raw->setNoDelay(enable);
++}
++
++void AesCtrSocket::setLingerTimeout(int timeout) {
++    raw->setLingerTimeout(timeout);
++}
++
++void AesCtrSocket::disableSigPipe() {
++    raw->disableSigPipe();
++}
++
++void AesCtrSocket::close() {
++    raw->close();
++}
++
+ SaslSocket::SaslSocket(shared_ptr<Socket> raw, shared_ptr<DigestMd5Client> sasl, int readTimeout,
+                        const std::string & datanode)
+     : raw(raw), sasl(sasl), readTimeout(readTimeout), datanode(datanode), rpos(0) {
+diff --git a/src/client/DataTransferSasl.h b/src/client/DataTransferSasl.h
+index ad2a093..5899a1b 100644
+--- a/src/client/DataTransferSasl.h
++++ b/src/client/DataTransferSasl.h
+@@ -23,6 +23,7 @@
+ #include "rpc/DigestMd5Client.h"
+ 
+ #include <string>
++#include <vector>
+ 
+ namespace Hdfs {
+ namespace Internal {
+@@ -49,11 +50,56 @@ bool DataTransferNeedsSasl(const std::string & qops, const Token & blockToken, i
+  * user base64(token identifier), password base64(token password), digest-uri "hdfs/0".
+  * Returns the socket to use from now on: the same one for QOP auth, a SaslSocket wrapping it for auth-int /
+  * auth-conf (frames of int32 length + wrapped token both ways, as SaslInputStream / SaslOutputStream).
++ * cipherSuites (dfs.encrypt.data.transfer.cipher.suites): "" or "AES/CTR/NoPadding"; with the latter and a
++ * negotiated auth-conf the client offers an AES/CTR cipher option, and if the DataNode accepts it (its own
++ * cipher.suites set) the stream is an AesCtrSocket with the SASL-unwrapped keys (as Hadoop's
++ * DataTransferSaslUtil.createStreamPair), else the SaslSocket as without the setting.
+  */
+ shared_ptr<Socket> DataTransferSaslConnect(shared_ptr<Socket> sock, const Token & blockToken,
+-                                           const std::string & qops, int readTimeout, int writeTimeout,
++                                           const std::string & qops, const std::string & cipherSuites,
++                                           int readTimeout, int writeTimeout,
+                                            const std::string & datanode);
+ 
++/**
++ * Socket decorator for the AES/CTR cipher option: a continuous AES-CTR stream per direction (Hadoop's
++ * CryptoInputStream / CryptoOutputStream from stream offset 0; the 128-bit IV counts up big-endian as OpenSSL's
++ * CTR mode), no framing, so read() / poll() map 1:1 to the raw socket.
++ */
++class AesCtrSocket : public Socket {
++public:
++    /** encKey/encIv: client -> DataNode (the option's inKey/inIv); decKey/decIv: DataNode -> client (outKey/outIv) */
++    AesCtrSocket(shared_ptr<Socket> raw, const std::string & encKey, const std::string & encIv,
++                 const std::string & decKey, const std::string & decIv, int writeTimeout,
++                 const std::string & datanode);
++    ~AesCtrSocket();
++
++    int32_t read(char * buffer, int32_t size);
++    void readFully(char * buffer, int32_t size, int timeout);
++    int32_t write(const char * buffer, int32_t size);
++    void writeFully(const char * buffer, int32_t size, int timeout);
++    void connect(const char * host, int port, int timeout);
++    void connect(const char * host, const char * port, int timeout);
++    void connect(struct addrinfo * paddr, const char * host, const char * port, int timeout);
++    bool poll(bool read, bool write, int timeout);
++    void setBlockMode(bool enable);
++    void setNoDelay(bool enable);
++    void setLingerTimeout(int timeout);
++    void disableSigPipe();
++    void close();
++
++private:
++    AesCtrSocket(const AesCtrSocket &);
++    AesCtrSocket & operator=(const AesCtrSocket &);
++    void crypt(void * ctx, const char * in, char * out, int32_t size);
++
++    shared_ptr<Socket> raw;
++    void * enc;
++    void * dec;
++    std::string datanode;
++    int writeTimeout;
++    std::vector<char> wbuf;
++};
++
+ /**
+  * Socket decorator that wraps every write and unwraps every read with a negotiated DIGEST-MD5 session.
+  * read() returns bytes of at most one unwrapped frame; poll(read) is true while unwrapped bytes are buffered.
+diff --git a/src/client/RemoteBlockReader.cpp b/src/client/RemoteBlockReader.cpp
+index db9e482..a175a05 100644
+--- a/src/client/RemoteBlockReader.cpp
++++ b/src/client/RemoteBlockReader.cpp
+@@ -74,7 +74,7 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+     std::string qops = DataTransferProtectionToQops(conf.getDataTransferProtection());
+     if (!sockFromCache && DataTransferNeedsSasl(qops, token, datanode.getXferPort())) {
+         try {
+-            sock = DataTransferSaslConnect(sock, token, qops, readTimeout, writeTimeout, datanode.formatAddress());
++            sock = DataTransferSaslConnect(sock, token, qops, conf.getDataTransferCipherSuites(), readTimeout, writeTimeout, datanode.formatAddress());
+         } catch (...) {
+             sock->close();
+             throw;
+diff --git a/src/common/SessionConfig.cpp b/src/common/SessionConfig.cpp
+index f75a679..4c3a955 100644
+--- a/src/common/SessionConfig.cpp
++++ b/src/common/SessionConfig.cpp
+@@ -151,7 +151,8 @@ SessionConfig::SessionConfig(const Config & conf) {
+         {&kerberosCachePath, "hadoop.security.kerberos.ticket.cache.path", "" },
+         {&logSeverity, "dfs.client.log.severity", "INFO" },
+         {&domainSocketPath, "dfs.domain.socket.path", ""},
+-        {&dataTransferProtection, "dfs.data.transfer.protection", ""}
++        {&dataTransferProtection, "dfs.data.transfer.protection", ""},
++        {&dataTransferCipherSuites, "dfs.encrypt.data.transfer.cipher.suites", ""}
+     };
+ 
+     for (size_t i = 0; i < ARRAYSIZE(boolValues); ++i) {
+diff --git a/src/common/SessionConfig.h b/src/common/SessionConfig.h
+index ec36090..90c5afc 100644
+--- a/src/common/SessionConfig.h
++++ b/src/common/SessionConfig.h
+@@ -159,6 +159,14 @@ public:
+         return dataTransferProtection;
+     }
+ 
++    /*
++     * dfs.encrypt.data.transfer.cipher.suites ("AES/CTR/NoPadding" or ""): with privacy, ask the DataNode for an
++     * AES/CTR cipher option; the stream is then AES encrypted instead of DIGEST-MD5 wrapped
++     */
++    const std::string & getDataTransferCipherSuites() const {
++        return dataTransferCipherSuites;
++    }
++
+     /*
+      * OutputStream configure
+      */
+@@ -378,6 +386,7 @@ public:
+     int32_t socketCacheExpiry;
+     std::string domainSocketPath;
+     std::string dataTransferProtection;
++    std::string dataTransferCipherSuites;
+     int32_t stripeReaderThreadPoolSize;
+ 
+     /*
+diff --git a/src/proto/datatransfer.proto b/src/proto/datatransfer.proto
+index 3de6c4b..6b74aa9 100644
+--- a/src/proto/datatransfer.proto
++++ b/src/proto/datatransfer.proto
+@@ -34,6 +34,27 @@ package Hdfs.Internal;
+ import "Security.proto";
+ import "hdfs.proto";
+ 
++/**
++ * Cipher suite of the data-transfer cipher option (Hadoop: hdfs.proto CipherSuiteProto)
++ */
++enum CipherSuiteProto {
++    CIPHER_SUITE_UNKNOWN = 1;  // Hadoop: UNKNOWN (renamed: enum values are package scope in C++)
++    AES_CTR_NOPADDING = 2;
++    SM4_CTR_NOPADDING = 3;
++}
++
++/**
++ * Cipher option negotiated in the data-transfer SASL handshake (dfs.encrypt.data.transfer.cipher.suites);
++ * the DataNode sends the keys SASL-wrapped (auth-conf), the IVs in the clear
++ */
++message CipherOptionProto {
++  required CipherSuiteProto suite = 1;
++  optional bytes inKey = 2;
++  optional bytes inIv = 3;
++  optional bytes outKey = 4;
++  optional bytes outIv = 5;
++}
++
+ message DataTransferEncryptorMessageProto {
+   enum DataTransferEncryptorStatus {
+     SUCCESS = 0;
+@@ -43,6 +64,7 @@ message DataTransferEncryptorMessageProto {
+   required DataTransferEncryptorStatus status = 1;
+   optional bytes payload = 2;
+   optional string message = 3;
++  repeated CipherOptionProto cipherOption = 4;
+ }
+ 
+ message BaseHeaderProto {
+-- 
+2.43.0
+

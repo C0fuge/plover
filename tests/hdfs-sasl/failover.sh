@@ -35,7 +35,9 @@ live() {
 
 # one DuckDB process fed through a FIFO; each step COPYs its result to /tmp/r<k>.csv, then writes a sentinel
 rm -f /tmp/r*.csv /tmp/done* /tmp/fo.in; mkfifo /tmp/fo.in
-LIBHDFS3_CONF=/tmp/privacy.xml $D -unsigned < /tmp/fo.in > /tmp/fo.out 2> /tmp/fo.err &
+CONF=/tmp/privacy.xml; [ -f /tmp/aes.xml ] && CONF=/tmp/aes.xml  # AES/CTR when run.sh made it
+echo "client conf $CONF"
+LIBHDFS3_CONF=$CONF $D -unsigned < /tmp/fo.in > /tmp/fo.out 2> /tmp/fo.err &
 DPID=$!
 exec 3> /tmp/fo.in
 echo "LOAD '$EXT'; SET hdfs_metadata_cache_ttl_ms = 600000; SET hdfs_read_timeout_ms = 5000; SET hdfs_connect_timeout_ms = 3000;" >&3
