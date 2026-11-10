@@ -25,8 +25,8 @@ host() { # host <kill|start> <dnI>: ask the workflow's watcher, wait for the ack
   echo "FAIL: no ack for $1 $2"; exit 1
 }
 blocks_read() { # blocks_read <i>: DataNodeActivity BlocksRead of DataNode i (0 when down)
-  curl -sf "http://localhost:$((9864 + 10 * ($1 - 1)))/jmx?qry=Hadoop:service=DataNode,name=DataNodeActivity-*" |
-    grep -o '"BlocksRead" : [0-9]*' | grep -o '[0-9]*$' || echo 0
+  curl -sf "http://localhost:$((9864 + 10 * ($1 - 1)))/jmx?qry=Hadoop:service=DataNode,name=DataNodeActivity*" |
+    /usr/libexec/platform-python -c 'import json,sys; print(sum(b.get("BlocksRead", 0) for b in json.load(sys.stdin)["beans"]))' 2>/dev/null || echo 0
 }
 live() {
   curl -sf "http://localhost:9870/jmx?qry=Hadoop:service=NameNode,name=FSNamesystemState" |
@@ -62,7 +62,8 @@ for i in $(seq 1 "$N"); do
   [ $d -gt 0 ] && served=$((served + 1))
   [ $d -gt $(( $(blocks_read $best) - before[best] )) ] && best=$i
 done
-[ $served -ge 2 ] || { echo "FAIL: only $served DataNode(s) served blocks"; exit 1; }
+[ $served -ge 2 ] || { echo "FAIL: only $served DataNode(s) served blocks"
+  curl -s "http://localhost:9864/jmx?qry=Hadoop:service=DataNode,name=DataNodeActivity*" | head -c 1500; exit 1; }
 
 # 2. kill the busiest DataNode between scans (cached locations, pooled connections to it)
 host kill dn$best; echo "killed dn$best"
