@@ -39,6 +39,8 @@ LIBHDFS3_CONF=/tmp/privacy.xml $D -unsigned < /tmp/fo.in > /tmp/fo.out 2> /tmp/f
 DPID=$!
 exec 3> /tmp/fo.in
 echo "LOAD '$EXT'; SET hdfs_metadata_cache_ttl_ms = 600000; SET hdfs_read_timeout_ms = 5000; SET hdfs_connect_timeout_ms = 3000;" >&3
+# DuckDB's in-memory external file cache would serve repeated scans without any DataNode read
+echo "SET enable_external_file_cache = false;" >&3
 step=0
 send() { # send: start the scan as step k (async)
   step=$((step + 1)); t0=$(date +%s.%N)
@@ -69,7 +71,10 @@ done
 
 # 2. kill the busiest DataNode between scans (cached locations, pooled connections to it)
 host kill dn$best; echo "killed dn$best"
+mid=(); for i in $(seq 1 "$N"); do mid[$i]=$(blocks_read $i); done
 send; wait_step
+sleep 11; d=0; for i in $(seq 1 "$N"); do [ $i = $best ] || d=$(( d + $(blocks_read $i) - mid[i] )); done
+echo "step 2: $d blocks from the other DataNodes"; [ $d -gt 0 ] || { echo "FAIL: step 2 read no blocks"; exit 1; }
 
 # 3. restart it, then kill another DataNode mid-scan
 host start dn$best
