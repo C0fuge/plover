@@ -1,0 +1,520 @@
+From 4f4fb78e9a0deee785c0ee967a35cfb1d2b62989 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 03:59:13 +0000
+Subject: [PATCH] libhdfs3: SASL data-transfer protection on the read path
+ (dfs.data.transfer.protection)
+
+A DataNode on a non-privileged port with dfs.data.transfer.protection
+requires the SASL handshake of Hadoop's SaslDataTransferClient before
+any op; libhdfs3 sent READ_BLOCK in plain and the DataNode dropped it.
+
+- SessionConfig: dfs.data.transfer.protection (authentication,
+  integrity, privacy; comma list in preference order) -> DIGEST-MD5
+  QOPs auth, auth-int, auth-conf
+- RemoteBlockReader: on a new connection, when protection is set, the
+  block token is non-empty and the transfer port is >= 1024 (as
+  Hadoop: privileged ports are trusted), DataTransferSaslConnect does
+  the handshake: magic 0xDEADBEEF, varint-delimited
+  DataTransferEncryptorMessageProto, DIGEST-MD5 (patch 0003) with user
+  base64(token identifier), password base64(token password),
+  digest-uri hdfs/0; ERROR / ERROR_UNKNOWN_KEY -> HdfsIOException, so
+  the stream tries the next replica
+- auth-int / auth-conf: SaslSocket decorates the socket: every write is
+  wrapped into frames of int32 length + token (chunks of the server's
+  maxbuf), every read unwraps one frame (SaslInputStream /
+  SaslOutputStream); pooled connections keep their SaslSocket (the
+  DataNode keeps the SASL streams for the connection's later ops)
+- short-circuit reads and the write Pipeline unchanged; no AES cipher
+  option (the DataNode then uses DIGEST-MD5 auth-conf itself)
+---
+ src/client/DataTransferSasl.cpp  | 273 +++++++++++++++++++++++++++++++
+ src/client/DataTransferSasl.h    |  94 +++++++++++
+ src/client/RemoteBlockReader.cpp |  14 ++
+ src/client/RemoteBlockReader.h   |   1 +
+ src/common/SessionConfig.cpp     |   3 +-
+ src/common/SessionConfig.h       |   9 +
+ 6 files changed, 393 insertions(+), 1 deletion(-)
+ create mode 100644 src/client/DataTransferSasl.cpp
+ create mode 100644 src/client/DataTransferSasl.h
+
+diff --git a/src/client/DataTransferSasl.cpp b/src/client/DataTransferSasl.cpp
+new file mode 100644
+index 0000000..0ea6eff
+--- /dev/null
++++ b/src/client/DataTransferSasl.cpp
+@@ -0,0 +1,273 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include "DataTransferSasl.h"
++
++#include "Exception.h"
++#include "ExceptionInternal.h"
++#include "Token.h"
++#include "WriteBuffer.h"
++#include "datatransfer.pb.h"
++
++#include <openssl/evp.h>
++
++#include <algorithm>
++#include <cstring>
++#include <vector>
++
++namespace Hdfs {
++namespace Internal {
++
++static const int32_t SASL_TRANSFER_MAGIC_NUMBER = static_cast<int32_t>(0xDEADBEEF);
++static const int32_t MAX_SASL_MESSAGE = 64 * 1024;
++static const int32_t MAX_SASL_FRAME = 16 * 1024 * 1024;
++
++static std::string Base64(const std::string & in) {
++    std::string out(4 * ((in.size() + 2) / 3) + 1, '\0');
++    int n = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(&out[0]),
++                            reinterpret_cast<const unsigned char *>(in.data()), static_cast<int>(in.size()));
++    out.resize(n);
++    return out;
++}
++
++std::string DataTransferProtectionToQops(const std::string & protection) {
++    std::string qops, item;
++    for (size_t i = 0; i <= protection.size(); ++i) {
++        if (i == protection.size() || protection[i] == ',') {
++            item.erase(0, item.find_first_not_of(" \t"));
++            item.erase(item.find_last_not_of(" \t") + 1);
++            std::transform(item.begin(), item.end(), item.begin(), ::tolower);
++            const char * q = NULL;
++            if (item == "authentication") {
++                q = "auth";
++            } else if (item == "integrity") {
++                q = "auth-int";
++            } else if (item == "privacy") {
++                q = "auth-conf";
++            } else if (!item.empty()) {
++                THROW(HdfsIOException, "unknown dfs.data.transfer.protection value \"%s\" (authentication, integrity, privacy)",
++                      item.c_str());
++            }
++            if (q) {
++                qops += (qops.empty() ? "" : ",") + std::string(q);
++            }
++            item.clear();
++        } else {
++            item.push_back(protection[i]);
++        }
++    }
++    return qops;
++}
++
++bool DataTransferNeedsSasl(const std::string & qops, const Token & blockToken, int xferPort) {
++    return !qops.empty() && !blockToken.getIdentifier().empty() && xferPort >= 1024;
++}
++
++static void SendSaslMessage(Socket & sock, const std::string & payload, int writeTimeout) {
++    DataTransferEncryptorMessageProto msg;
++    msg.set_status(DataTransferEncryptorMessageProto_DataTransferEncryptorStatus_SUCCESS);
++    msg.set_payload(payload);
++    WriteBuffer buffer;
++    int size = msg.ByteSize();
++    buffer.writeVarint32(size);
++    char * b = buffer.alloc(size);
++    if (!msg.SerializeToArray(b, size)) {
++        THROW(HdfsIOException, "DataTransferSasl: cannot serialize the SASL message");
++    }
++    sock.writeFully(buffer.getBuffer(0), buffer.getDataSize(0), writeTimeout);
++}
++
++static std::string ReadSaslMessage(Socket & sock, int readTimeout, const std::string & datanode) {
++    uint32_t size = 0;
++    for (int shift = 0;; shift += 7) {
++        unsigned char c;
++        sock.readFully(reinterpret_cast<char *>(&c), 1, readTimeout);
++        size |= static_cast<uint32_t>(c & 0x7f) << shift;
++        if (!(c & 0x80)) {
++            break;
++        }
++        if (shift >= 28) {
++            THROW(HdfsIOException, "DataTransferSasl: bad message length from DataNode %s", datanode.c_str());
++        }
++    }
++    if (size == 0 || size > static_cast<uint32_t>(MAX_SASL_MESSAGE)) {
++        THROW(HdfsIOException, "DataTransferSasl: bad message length %u from DataNode %s (does it expect SASL?)",
++              size, datanode.c_str());
++    }
++    std::vector<char> buf(size);
++    sock.readFully(&buf[0], size, readTimeout);
++    DataTransferEncryptorMessageProto msg;
++    if (!msg.ParseFromArray(&buf[0], size)) {
++        THROW(HdfsIOException, "DataTransferSasl: cannot parse the SASL message from DataNode %s", datanode.c_str());
++    }
++    if (msg.status() == DataTransferEncryptorMessageProto_DataTransferEncryptorStatus_ERROR_UNKNOWN_KEY) {
++        THROW(HdfsIOException, "DataTransferSasl: DataNode %s: unknown key: %s", datanode.c_str(), msg.message().c_str());
++    }
++    if (msg.status() != DataTransferEncryptorMessageProto_DataTransferEncryptorStatus_SUCCESS) {
++        THROW(HdfsIOException, "DataTransferSasl: DataNode %s refused the SASL handshake: %s", datanode.c_str(),
++              msg.message().c_str());
++    }
++    return msg.payload();
++}
++
++shared_ptr<Socket> DataTransferSaslConnect(shared_ptr<Socket> sock, const Token & blockToken,
++                                           const std::string & qops, int readTimeout, int writeTimeout,
++                                           const std::string & datanode) {
++    shared_ptr<DigestMd5Client> sasl(new DigestMd5Client(Base64(blockToken.getIdentifier()),
++                                                         Base64(blockToken.getPassword()), "hdfs", "0", qops));
++    try {
++        char magic[4];
++        magic[0] = (SASL_TRANSFER_MAGIC_NUMBER >> 24) & 0xff;
++        magic[1] = (SASL_TRANSFER_MAGIC_NUMBER >> 16) & 0xff;
++        magic[2] = (SASL_TRANSFER_MAGIC_NUMBER >> 8) & 0xff;
++        magic[3] = SASL_TRANSFER_MAGIC_NUMBER & 0xff;
++        sock->writeFully(magic, 4, writeTimeout);
++        SendSaslMessage(*sock, std::string(), writeTimeout);
++        std::string challenge = ReadSaslMessage(*sock, readTimeout, datanode);
++        SendSaslMessage(*sock, sasl->evaluateChallenge(challenge), writeTimeout);
++        std::string rspauth = ReadSaslMessage(*sock, readTimeout, datanode);
++        sasl->evaluateChallenge(rspauth);
++    } catch (const DigestMd5Error & e) {
++        THROW(HdfsIOException, "DataTransferSasl: SASL handshake with DataNode %s failed: %s", datanode.c_str(), e.what());
++    }
++    if (!sasl->isComplete()) {
++        THROW(HdfsIOException, "DataTransferSasl: SASL handshake with DataNode %s did not complete", datanode.c_str());
++    }
++    if (!sasl->isWrapping()) {
++        return sock;
++    }
++    return shared_ptr<Socket>(new SaslSocket(sock, sasl, readTimeout, datanode));
++}
++
++SaslSocket::SaslSocket(shared_ptr<Socket> raw, shared_ptr<DigestMd5Client> sasl, int readTimeout,
++                       const std::string & datanode)
++    : raw(raw), sasl(sasl), readTimeout(readTimeout), datanode(datanode), rpos(0) {
++}
++
++void SaslSocket::fill(int timeout) {
++    while (rpos >= rbuf.size()) {
++        unsigned char len[4];
++        raw->readFully(reinterpret_cast<char *>(len), 4, timeout);
++        int32_t n = static_cast<int32_t>((static_cast<uint32_t>(len[0]) << 24) | (static_cast<uint32_t>(len[1]) << 16) |
++                                         (static_cast<uint32_t>(len[2]) << 8) | len[3]);
++        if (n < 0 || n > MAX_SASL_FRAME) {
++            THROW(HdfsIOException, "SaslSocket: bad frame length %d from DataNode %s", n, datanode.c_str());
++        }
++        std::string frame(n, '\0');
++        if (n) {
++            raw->readFully(&frame[0], n, timeout);
++        }
++        try {
++            rbuf = sasl->unwrap(frame.data(), frame.size());
++        } catch (const DigestMd5Error & e) {
++            THROW(HdfsIOException, "SaslSocket: data from DataNode %s: %s", datanode.c_str(), e.what());
++        }
++        rpos = 0;
++    }
++}
++
++int32_t SaslSocket::read(char * buffer, int32_t size) {
++    fill(readTimeout);
++    int32_t n = static_cast<int32_t>(std::min(static_cast<size_t>(size), rbuf.size() - rpos));
++    memcpy(buffer, rbuf.data() + rpos, n);
++    rpos += n;
++    return n;
++}
++
++void SaslSocket::readFully(char * buffer, int32_t size, int timeout) {
++    int32_t done = 0;
++    while (done < size) {
++        fill(timeout);
++        int32_t n = static_cast<int32_t>(std::min(static_cast<size_t>(size - done), rbuf.size() - rpos));
++        memcpy(buffer + done, rbuf.data() + rpos, n);
++        rpos += n;
++        done += n;
++    }
++}
++
++int32_t SaslSocket::write(const char * buffer, int32_t size) {
++    // a frame is all or nothing: write it fully
++    writeFully(buffer, size, readTimeout);
++    return size;
++}
++
++void SaslSocket::writeFully(const char * buffer, int32_t size, int timeout) {
++    size_t chunk = sasl->maxRawSendSize();
++    if (chunk == 0) {
++        THROW(HdfsIOException, "SaslSocket: DataNode %s maxbuf too small", datanode.c_str());
++    }
++    for (int32_t off = 0; off < size;) {
++        size_t n = std::min(chunk, static_cast<size_t>(size - off));
++        std::string token;
++        try {
++            token = sasl->wrap(buffer + off, n);
++        } catch (const DigestMd5Error & e) {
++            THROW(HdfsIOException, "SaslSocket: data to DataNode %s: %s", datanode.c_str(), e.what());
++        }
++        std::string frame(4, '\0');
++        uint32_t t = static_cast<uint32_t>(token.size());
++        frame[0] = (t >> 24) & 0xff;
++        frame[1] = (t >> 16) & 0xff;
++        frame[2] = (t >> 8) & 0xff;
++        frame[3] = t & 0xff;
++        frame += token;
++        raw->writeFully(frame.data(), static_cast<int32_t>(frame.size()), timeout);
++        off += static_cast<int32_t>(n);
++    }
++}
++
++void SaslSocket::connect(const char *, int, int) {
++    THROW(HdfsIOException, "SaslSocket: connect on a SASL socket");
++}
++
++void SaslSocket::connect(const char *, const char *, int) {
++    THROW(HdfsIOException, "SaslSocket: connect on a SASL socket");
++}
++
++void SaslSocket::connect(struct addrinfo *, const char *, const char *, int) {
++    THROW(HdfsIOException, "SaslSocket: connect on a SASL socket");
++}
++
++bool SaslSocket::poll(bool read, bool write, int timeout) {
++    if (read && rpos < rbuf.size()) {
++        return true;
++    }
++    return raw->poll(read, write, timeout);
++}
++
++void SaslSocket::setBlockMode(bool enable) {
++    raw->setBlockMode(enable);
++}
++
++void SaslSocket::setNoDelay(bool enable) {
++    raw->setNoDelay(enable);
++}
++
++void SaslSocket::setLingerTimeout(int timeout) {
++    raw->setLingerTimeout(timeout);
++}
++
++void SaslSocket::disableSigPipe() {
++    raw->disableSigPipe();
++}
++
++void SaslSocket::close() {
++    raw->close();
++}
++
++}
++}
+diff --git a/src/client/DataTransferSasl.h b/src/client/DataTransferSasl.h
+new file mode 100644
+index 0000000..ad2a093
+--- /dev/null
++++ b/src/client/DataTransferSasl.h
+@@ -0,0 +1,94 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef _HDFS_LIBHDFS3_CLIENT_DATATRANSFERSASL_H_
++#define _HDFS_LIBHDFS3_CLIENT_DATATRANSFERSASL_H_
++
++#include "Memory.h"
++#include "network/Socket.h"
++#include "rpc/DigestMd5Client.h"
++
++#include <string>
++
++namespace Hdfs {
++namespace Internal {
++
++class Token;
++
++/**
++ * dfs.data.transfer.protection value ("authentication", "integrity", "privacy", comma separated, in preference
++ * order) -> DIGEST-MD5 QOP list ("auth", "auth-int", "auth-conf"); "" if unset. Throws HdfsConfigInvalid-like
++ * HdfsIOException for an unknown value.
++ */
++std::string DataTransferProtectionToQops(const std::string & protection);
++
++/**
++ * True if a connection to a DataNode transfer port must do the SASL handshake, as Hadoop's
++ * SaslDataTransferClient: protection configured, a block token present, and a non-privileged port
++ * (a DataNode on a privileged port is trusted by its port, no SASL).
++ */
++bool DataTransferNeedsSasl(const std::string & qops, const Token & blockToken, int xferPort);
++
++/**
++ * Hadoop data-transfer SASL handshake (SaslDataTransferClient.doSaslHandshake) on a freshly connected
++ * socket: magic 0xDEADBEEF, DataTransferEncryptorMessageProto messages (varint delimited), DIGEST-MD5 with
++ * user base64(token identifier), password base64(token password), digest-uri "hdfs/0".
++ * Returns the socket to use from now on: the same one for QOP auth, a SaslSocket wrapping it for auth-int /
++ * auth-conf (frames of int32 length + wrapped token both ways, as SaslInputStream / SaslOutputStream).
++ */
++shared_ptr<Socket> DataTransferSaslConnect(shared_ptr<Socket> sock, const Token & blockToken,
++                                           const std::string & qops, int readTimeout, int writeTimeout,
++                                           const std::string & datanode);
++
++/**
++ * Socket decorator that wraps every write and unwraps every read with a negotiated DIGEST-MD5 session.
++ * read() returns bytes of at most one unwrapped frame; poll(read) is true while unwrapped bytes are buffered.
++ */
++class SaslSocket : public Socket {
++public:
++    SaslSocket(shared_ptr<Socket> raw, shared_ptr<DigestMd5Client> sasl, int readTimeout,
++               const std::string & datanode);
++
++    int32_t read(char * buffer, int32_t size);
++    void readFully(char * buffer, int32_t size, int timeout);
++    int32_t write(const char * buffer, int32_t size);
++    void writeFully(const char * buffer, int32_t size, int timeout);
++    void connect(const char * host, int port, int timeout);
++    void connect(const char * host, const char * port, int timeout);
++    void connect(struct addrinfo * paddr, const char * host, const char * port, int timeout);
++    bool poll(bool read, bool write, int timeout);
++    void setBlockMode(bool enable);
++    void setNoDelay(bool enable);
++    void setLingerTimeout(int timeout);
++    void disableSigPipe();
++    void close();
++
++private:
++    void fill(int timeout);
++
++    shared_ptr<Socket> raw;
++    shared_ptr<DigestMd5Client> sasl;
++    int readTimeout;
++    std::string datanode;
++    std::string rbuf;
++    size_t rpos;
++};
++
++}
++}
++
++#endif /* _HDFS_LIBHDFS3_CLIENT_DATATRANSFERSASL_H_ */
+diff --git a/src/client/RemoteBlockReader.cpp b/src/client/RemoteBlockReader.cpp
+index e43a698..db9e482 100644
+--- a/src/client/RemoteBlockReader.cpp
++++ b/src/client/RemoteBlockReader.cpp
+@@ -28,6 +28,7 @@
+ #include "BigEndian.h"
+ #include "Crc32.h"
+ #include "DataTransferProtocolSender.h"
++#include "DataTransferSasl.h"
+ #include "Exception.h"
+ #include "ExceptionInternal.h"
+ #include "HWCrc32c.h"
+@@ -51,6 +52,7 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+                                      SessionConfig& conf)
+     : sentStatus(false),
+       verify(verify),
++      sockFromCache(false),
+       binfo(eb),
+       datanode(datanode),
+       checksumSize(0),
+@@ -67,6 +69,17 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+     writeTimeout = conf.getInputWriteTimeout();
+     connTimeout = conf.getInputConnTimeout();
+     sock = getNextPeer(datanode, conf.connectViaHostname());
++    // SASL data-transfer protection (dfs.data.transfer.protection): handshake on a new connection only; a pooled
++    // connection is already the SaslSocket of its handshake (the DataNode keeps the SASL streams per connection)
++    std::string qops = DataTransferProtectionToQops(conf.getDataTransferProtection());
++    if (!sockFromCache && DataTransferNeedsSasl(qops, token, datanode.getXferPort())) {
++        try {
++            sock = DataTransferSaslConnect(sock, token, qops, readTimeout, writeTimeout, datanode.formatAddress());
++        } catch (...) {
++            sock->close();
++            throw;
++        }
++    }
+     in = shared_ptr<BufferedSocketReader>(new BufferedSocketReaderImpl(*sock));
+     sender = shared_ptr<DataTransferProtocol>(new DataTransferProtocolSender(
+         *sock, writeTimeout, datanode.formatAddress()));
+@@ -86,6 +99,7 @@ shared_ptr<Socket> RemoteBlockReader::getNextPeer(const DatanodeInfo& dn, const
+     shared_ptr<Socket> sock;
+     try {
+         sock = peerCache.getConnection(dn);
++        sockFromCache = static_cast<bool>(sock);
+ 
+         if (!sock) {
+             sock = shared_ptr<Socket>(new TcpSocketImpl);
+diff --git a/src/client/RemoteBlockReader.h b/src/client/RemoteBlockReader.h
+index 9d91ad2..3a66ea8 100644
+--- a/src/client/RemoteBlockReader.h
++++ b/src/client/RemoteBlockReader.h
+@@ -85,6 +85,7 @@ private:
+ private:
+     bool sentStatus;
+     bool verify; //verify checksum or not.
++    bool sockFromCache; //the connection came from the PeerCache (SASL already done)
+     const ExtendedBlock & binfo;
+     DatanodeInfo datanode;
+     int checksumSize;
+diff --git a/src/common/SessionConfig.cpp b/src/common/SessionConfig.cpp
+index a94cce9..f75a679 100644
+--- a/src/common/SessionConfig.cpp
++++ b/src/common/SessionConfig.cpp
+@@ -150,7 +150,8 @@ SessionConfig::SessionConfig(const Config & conf) {
+         {&rpcAuthMethod, "hadoop.security.authentication", "simple" },
+         {&kerberosCachePath, "hadoop.security.kerberos.ticket.cache.path", "" },
+         {&logSeverity, "dfs.client.log.severity", "INFO" },
+-        {&domainSocketPath, "dfs.domain.socket.path", ""}
++        {&domainSocketPath, "dfs.domain.socket.path", ""},
++        {&dataTransferProtection, "dfs.data.transfer.protection", ""}
+     };
+ 
+     for (size_t i = 0; i < ARRAYSIZE(boolValues); ++i) {
+diff --git a/src/common/SessionConfig.h b/src/common/SessionConfig.h
+index 644544f..ec36090 100644
+--- a/src/common/SessionConfig.h
++++ b/src/common/SessionConfig.h
+@@ -151,6 +151,14 @@ public:
+         return connectToDnViaHostname;
+     }
+ 
++    /*
++     * dfs.data.transfer.protection (authentication / integrity / privacy, comma separated): SASL
++     * DIGEST-MD5 on the block token when reading from a DataNode on a non-privileged port; "" = off
++     */
++    const std::string & getDataTransferProtection() const {
++        return dataTransferProtection;
++    }
++
+     /*
+      * OutputStream configure
+      */
+@@ -369,6 +377,7 @@ public:
+     int32_t socketCacheCapacity;
+     int32_t socketCacheExpiry;
+     std::string domainSocketPath;
++    std::string dataTransferProtection;
+     int32_t stripeReaderThreadPoolSize;
+ 
+     /*
+-- 
+2.43.0
+
