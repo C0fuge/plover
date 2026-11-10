@@ -5,6 +5,11 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+> **Maintainer, 2026-11-10 11:25 - check first:** the real cluster's DataNodes use `dfs.data.transfer.protection =
+> authentication,privacy` (several QOPs, client and DataNode negotiate). Add that value to the SASL HDFS test (DataNode
+> side `authentication,privacy`, client side the same and also `privacy` only / `authentication` only) and fix the
+> negotiation if needed; release the fix as the next afc build.
+
 > **Session 2026-11-10 (3): item (1) pin bump done - afc8 released (https://github.com/C0fuge/plover/releases/tag/hadoopfs-51b7220-afc8-duckdb-v1.5.6); nothing open from the maintainer's list.**
 > libhdfs3 pin 94a9ead -> 85dabf0 (master 2026-11-05: c5dc2bd/c67cd2e slow-DataNode avoidance, d9c26dc malformed
 > Datanode/Namenode response validation, 952ee51 no thread/object addresses in logs). Our libhdfs3 0002-0005 applied
