@@ -54,4 +54,9 @@ $D -unsigned -csv -noheader -c "LOAD '$EXT';
   SELECT last_modified, last_modified > now() - INTERVAL 1 DAY AND last_modified < now() + INTERVAL 1 HOUR
   FROM read_blob('$URL/f0.parquet');" | tee /tmp/mtime.csv
 grep -q ',true$' /tmp/mtime.csv
+# hdfs_transfer_info() without SASL: every DataNode connection is plain (qop none), no INFO negotiation line
+$D -unsigned -csv -noheader -c "LOAD '$EXT'; SELECT count(*) FROM read_parquet('$URL/f0.parquet');
+  SELECT qop, coalesce(cipher, 'NULL'), encrypted, connections > 0, failures FROM hdfs_transfer_info();" 2>/tmp/info.err | tee /tmp/info.csv
+[ "$(tail -n +2 /tmp/info.csv | sort -u)" = "none,NULL,false,true,0" ] || { echo "FAIL: hdfs_transfer_info() without SASL"; exit 1; }
+! grep -q DataTransferSasl /tmp/info.err || { echo "FAIL: negotiation logged without SASL"; exit 1; }
 echo "hdfs test OK"

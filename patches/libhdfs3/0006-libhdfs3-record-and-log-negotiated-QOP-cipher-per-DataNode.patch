@@ -1,0 +1,493 @@
+From eedf06c187a23545eff5522f66861ce28374b17b Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 15:50:01 +0000
+Subject: [PATCH] libhdfs3: Record and log the negotiated data-transfer QOP / cipher per
+ DataNode
+
+The negotiated data-transfer protection was only logged at DEBUG1, and
+libhdfs3 prints nothing at all unless HDFS_ENABLE_LOGGING=true, so a
+caller could not tell auth from auth-conf or 3des from AES.
+
+- TransferInfo: process-wide record per DataNode (host(ip):xferPort) of
+  the last negotiated qop ("none" for plain connections without SASL),
+  cipher, AES key bits, new connections, failed handshakes, last error
+  (bounded to 10000 DataNodes).
+- Each new SASL connection logs "DataTransferSasl: DataNode <dn>: qop
+  <qop>, cipher <cipher>" (AES: "cipher option AES/CTR/NoPadding, key
+  <n> bits") at INFO; the first one per DataNode and any change is
+  written even without HDFS_ENABLE_LOGGING=true (LOG_ALWAYS, still
+  subject to dfs.client.log.severity), further ones through the normal
+  gated log.
+- C API hdfsGetDataTransferInfo / hdfsFreeDataTransferInfo.
+---
+ src/client/DataTransferSasl.cpp  | 32 +++++++++++--
+ src/client/Hdfs.cpp              | 53 +++++++++++++++++++++
+ src/client/RemoteBlockReader.cpp | 25 +++++++---
+ src/client/TransferInfo.cpp      | 80 ++++++++++++++++++++++++++++++++
+ src/client/TransferInfo.h        | 55 ++++++++++++++++++++++
+ src/client/hdfs.h                | 25 ++++++++++
+ src/common/Logger.cpp            | 34 +++++++++-----
+ src/common/Logger.h              |  9 ++++
+ 8 files changed, 292 insertions(+), 21 deletions(-)
+ create mode 100644 src/client/TransferInfo.cpp
+ create mode 100644 src/client/TransferInfo.h
+
+diff --git a/src/client/DataTransferSasl.cpp b/src/client/DataTransferSasl.cpp
+index 87a9d85..c2ebb17 100644
+--- a/src/client/DataTransferSasl.cpp
++++ b/src/client/DataTransferSasl.cpp
+@@ -21,6 +21,7 @@
+ #include "ExceptionInternal.h"
+ #include "Logger.h"
+ #include "Token.h"
++#include "TransferInfo.h"
+ #include "WriteBuffer.h"
+ #include "datatransfer.pb.h"
+ 
+@@ -135,6 +136,30 @@ static std::string ReadSaslMessage(Socket & sock, int readTimeout, const std::st
+     return msg.payload();
+ }
+ 
++// Record the negotiation (TransferInfo) and log it at INFO: always (also without HDFS_ENABLE_LOGGING=true) the first
++// time per DataNode and when its qop/cipher changes, else (every further new connection) through the normal gated log.
++// Line format kept from afc6..afc8 ("DataTransferSasl: DataNode <dn>: qop <qop>, cipher <cipher>"; AES: "qop auth-conf,
++// cipher option AES/CTR/NoPadding, key <n> bits").
++static void LogNegotiation(const std::string & datanode, const std::string & qop, const std::string & cipher,
++                           int keyBits) {
++    bool changed = TransferInfo::instance().record(datanode, qop, cipher, keyBits);
++    if (keyBits > 0) {
++        if (changed) {
++            LOG_ALWAYS(INFO, "DataTransferSasl: DataNode %s: qop %s, cipher option %s, key %d bits", datanode.c_str(),
++                       qop.c_str(), cipher.c_str(), keyBits);
++        } else {
++            LOG(INFO, "DataTransferSasl: DataNode %s: qop %s, cipher option %s, key %d bits", datanode.c_str(),
++                qop.c_str(), cipher.c_str(), keyBits);
++        }
++    } else if (changed) {
++        LOG_ALWAYS(INFO, "DataTransferSasl: DataNode %s: qop %s, cipher %s", datanode.c_str(), qop.c_str(),
++                   cipher.empty() ? "-" : cipher.c_str());
++    } else {
++        LOG(INFO, "DataTransferSasl: DataNode %s: qop %s, cipher %s", datanode.c_str(), qop.c_str(),
++            cipher.empty() ? "-" : cipher.c_str());
++    }
++}
++
+ shared_ptr<Socket> DataTransferSaslConnect(shared_ptr<Socket> sock, const Token & blockToken,
+                                            const std::string & qops, const std::string & cipherSuites,
+                                            int readTimeout, int writeTimeout, const std::string & datanode) {
+@@ -186,13 +211,12 @@ shared_ptr<Socket> DataTransferSaslConnect(shared_ptr<Socket> sock, const Token
+     }
+     if (sasl->qop() == "auth-conf" && last.cipheroption_size() > 0) {
+         const CipherOptionProto & opt = last.cipheroption(0);
+-        LOG(DEBUG1, "DataTransferSasl: DataNode %s: qop auth-conf, cipher option AES/CTR/NoPadding, key %d bits",
+-            datanode.c_str(), static_cast<int>(outKey.size() * 8));
++        int bits = static_cast<int>(outKey.size() * 8);
++        LogNegotiation(datanode, "auth-conf", AES_CTR_NOPADDING_NAME, bits);
+         return shared_ptr<Socket>(new AesCtrSocket(sock, inKey, opt.iniv(), outKey, opt.outiv(), writeTimeout,
+                                                    datanode));
+     }
+-    LOG(DEBUG1, "DataTransferSasl: DataNode %s: qop %s, cipher %s", datanode.c_str(), sasl->qop().c_str(),
+-        sasl->cipher().empty() ? "-" : sasl->cipher().c_str());
++    LogNegotiation(datanode, sasl->qop(), sasl->cipher(), 0);
+     if (!sasl->isWrapping()) {
+         return sock;
+     }
+diff --git a/src/client/Hdfs.cpp b/src/client/Hdfs.cpp
+index 08d20af..28b91e1 100644
+--- a/src/client/Hdfs.cpp
++++ b/src/client/Hdfs.cpp
+@@ -40,6 +40,7 @@
+ #include "server/LocatedBlocks.h"
+ #include "SessionConfig.h"
+ #include "Thread.h"
++#include "TransferInfo.h"
+ #include "XmlConfig.h"
+ 
+ #include <vector>
+@@ -811,6 +812,58 @@ hdfsFile hdfsOpenFileWithBlockLocations(hdfsFS fs, const char * path, hdfsBlockL
+     return NULL;
+ }
+ 
++hdfsDataTransferInfo * hdfsGetDataTransferInfo(int * numEntries) {
++    PARAMETER_ASSERT(numEntries, NULL, EINVAL);
++    *numEntries = 0;
++    hdfsDataTransferInfo * out = NULL;
++    int n = 0;
++    try {
++        std::vector<Hdfs::Internal::TransferInfoEntry> entries = Hdfs::Internal::TransferInfo::instance().snapshot();
++        if (entries.empty()) {
++            return NULL;
++        }
++        n = static_cast<int>(entries.size());
++        out = new hdfsDataTransferInfo[n](); // all pointers NULL: safe to free after a partial fill
++        for (int i = 0; i < n; ++i) {
++            const Hdfs::Internal::TransferInfoEntry & e = entries[i];
++            hdfsDataTransferInfo & o = out[i];
++            o.datanode = Strdup(e.datanode.c_str());
++            o.qop = Strdup(e.qop.c_str());
++            o.cipher = Strdup(e.cipher.c_str());
++            o.lastError = Strdup(e.lastError.c_str());
++            o.keyBits = e.keyBits;
++            o.connections = e.connections;
++            o.failures = e.failures;
++            o.firstMs = e.firstMs;
++            o.lastMs = e.lastMs;
++        }
++        *numEntries = n;
++        return out;
++    } catch (const std::bad_alloc & e) {
++        hdfsFreeDataTransferInfo(out, out ? n : 0);
++        SetErrorMessage("Out of memory");
++        errno = ENOMEM;
++    } catch (...) {
++        hdfsFreeDataTransferInfo(out, out ? n : 0);
++        SetLastException(Hdfs::current_exception());
++        handleException(Hdfs::current_exception());
++    }
++    return NULL;
++}
++
++void hdfsFreeDataTransferInfo(hdfsDataTransferInfo * info, int numEntries) {
++    if (!info) {
++        return;
++    }
++    for (int i = 0; i < numEntries; ++i) {
++        delete[] info[i].datanode;
++        delete[] info[i].qop;
++        delete[] info[i].cipher;
++        delete[] info[i].lastError;
++    }
++    delete[] info;
++}
++
+ int hdfsCloseFile(hdfsFS fs, hdfsFile file) {
+     PARAMETER_ASSERT(fs, -1, EINVAL);
+ 
+diff --git a/src/client/RemoteBlockReader.cpp b/src/client/RemoteBlockReader.cpp
+index 93ca6c3..66a67ea 100644
+--- a/src/client/RemoteBlockReader.cpp
++++ b/src/client/RemoteBlockReader.cpp
+@@ -29,6 +29,7 @@
+ #include "Crc32.h"
+ #include "DataTransferProtocolSender.h"
+ #include "DataTransferSasl.h"
++#include "TransferInfo.h"
+ #include "Exception.h"
+ #include "ExceptionInternal.h"
+ #include "HWCrc32c.h"
+@@ -78,12 +79,24 @@ RemoteBlockReader::RemoteBlockReader(const ExtendedBlock& eb,
+     // SASL data-transfer protection (dfs.data.transfer.protection): handshake on a new connection only; a pooled
+     // connection is already the SaslSocket of its handshake (the DataNode keeps the SASL streams per connection)
+     std::string qops = DataTransferProtectionToQops(conf.getDataTransferProtection());
+-    if (!sockFromCache && DataTransferNeedsSasl(qops, token, datanode.getXferPort())) {
+-        try {
+-            sock = DataTransferSaslConnect(sock, token, qops, conf.getDataTransferCipherSuites(), readTimeout, writeTimeout, datanode.formatAddress());
+-        } catch (...) {
+-            sock->close();
+-            throw;
++    if (!sockFromCache) {
++        // the negotiation per DataNode is recorded process-wide (TransferInfo, C API hdfsGetDataTransferInfo)
++        std::string dnAddr = datanode.formatAddress() + ":" + std::to_string(datanode.getXferPort());
++        if (DataTransferNeedsSasl(qops, token, datanode.getXferPort())) {
++            try {
++                sock = DataTransferSaslConnect(sock, token, qops, conf.getDataTransferCipherSuites(), readTimeout,
++                                               writeTimeout, dnAddr);
++            } catch (const std::exception & e) {
++                TransferInfo::instance().recordFailure(dnAddr, e.what());
++                sock->close();
++                throw;
++            } catch (...) {
++                TransferInfo::instance().recordFailure(dnAddr, "unknown error");
++                sock->close();
++                throw;
++            }
++        } else {
++            TransferInfo::instance().record(dnAddr, "none", "", 0);
+         }
+     }
+     in = shared_ptr<BufferedSocketReader>(new BufferedSocketReaderImpl(*sock));
+diff --git a/src/client/TransferInfo.cpp b/src/client/TransferInfo.cpp
+new file mode 100644
+index 0000000..8b43f17
+--- /dev/null
++++ b/src/client/TransferInfo.cpp
+@@ -0,0 +1,80 @@
++/*
++ * afc patch: process-wide record of the negotiated data-transfer QOP / cipher per DataNode (TransferInfo.h).
++ */
++#include "TransferInfo.h"
++
++#include <chrono>
++
++namespace Hdfs {
++namespace Internal {
++
++static int64_t NowMs() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++               std::chrono::system_clock::now().time_since_epoch()).count();
++}
++
++TransferInfo & TransferInfo::instance() {
++    static TransferInfo * info = new TransferInfo(); // never destroyed: readers may run during exit
++    return *info;
++}
++
++TransferInfoEntry * TransferInfo::get(const std::string & datanode, bool & isNew) {
++    auto it = entries.find(datanode);
++    isNew = it == entries.end();
++    if (!isNew) {
++        return &it->second;
++    }
++    if (entries.size() >= maxEntries) {
++        return nullptr;
++    }
++    TransferInfoEntry & e = entries[datanode];
++    e.datanode = datanode;
++    e.firstMs = NowMs();
++    return &e;
++}
++
++bool TransferInfo::record(const std::string & datanode, const std::string & qop, const std::string & cipher,
++                          int keyBits) {
++    std::lock_guard<std::mutex> lock(mut);
++    bool isNew;
++    TransferInfoEntry * e = get(datanode, isNew);
++    if (!e) {
++        return false;
++    }
++    bool changed = isNew || e->connections == 0 || e->qop != qop || e->cipher != cipher || e->keyBits != keyBits;
++    e->qop = qop;
++    e->cipher = cipher;
++    e->keyBits = keyBits;
++    ++e->connections;
++    e->lastMs = NowMs();
++    return changed;
++}
++
++void TransferInfo::recordFailure(const std::string & datanode, const std::string & error) {
++    std::lock_guard<std::mutex> lock(mut);
++    bool isNew;
++    TransferInfoEntry * e = get(datanode, isNew);
++    if (!e) {
++        return;
++    }
++    ++e->failures;
++    e->lastError = error.substr(0, 1000);
++}
++
++std::vector<TransferInfoEntry> TransferInfo::snapshot() const {
++    std::lock_guard<std::mutex> lock(mut);
++    std::vector<TransferInfoEntry> out;
++    out.reserve(entries.size());
++    for (const auto & kv : entries) {
++        out.push_back(kv.second);
++    }
++    return out;
++}
++
++void TransferInfo::clear() {
++    std::lock_guard<std::mutex> lock(mut);
++    entries.clear();
++}
++
++}
++}
+diff --git a/src/client/TransferInfo.h b/src/client/TransferInfo.h
+new file mode 100644
+index 0000000..35bbf72
+--- /dev/null
++++ b/src/client/TransferInfo.h
+@@ -0,0 +1,55 @@
++/*
++ * Process-wide record of the data-transfer protection negotiated with each DataNode (afc patch, see TransferInfo.cpp).
++ */
++#ifndef _HDFS_LIBHDFS3_CLIENT_TRANSFERINFO_H_
++#define _HDFS_LIBHDFS3_CLIENT_TRANSFERINFO_H_
++
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace Hdfs {
++namespace Internal {
++
++struct TransferInfoEntry {
++    std::string datanode;    // "host(ip):xferPort"
++    std::string qop;         // last negotiated: "auth", "auth-int", "auth-conf", or "none" (plain connection, no SASL)
++    std::string cipher;      // "AES/CTR/NoPadding", the DIGEST-MD5 cipher ("3des", "rc4", ...) or "" (no encryption)
++    int keyBits = 0;         // AES key length, 0 otherwise
++    int64_t connections = 0; // new connections set up (pooled re-uses not counted)
++    int64_t failures = 0;    // SASL handshakes that failed
++    int64_t firstMs = 0;     // unix ms of the first record
++    int64_t lastMs = 0;      // unix ms of the last successful connection (0: none yet)
++    std::string lastError;   // message of the last failed handshake
++};
++
++/**
++ * Every new connection of a remote block reader records here what was negotiated with its DataNode (one entry per
++ * DataNode, the last negotiation wins, counters add up), so a caller can prove which QOP / cipher its reads use
++ * (C API hdfsGetDataTransferInfo). Bounded: at most maxEntries DataNodes (further ones are not recorded).
++ * record() returns true when the entry is new or its qop/cipher changed (the caller logs that once at INFO).
++ */
++class TransferInfo {
++public:
++    static TransferInfo & instance();
++
++    bool record(const std::string & datanode, const std::string & qop, const std::string & cipher, int keyBits);
++    void recordFailure(const std::string & datanode, const std::string & error);
++    std::vector<TransferInfoEntry> snapshot() const;
++    void clear();
++
++    static const size_t maxEntries = 10000;
++
++private:
++    TransferInfoEntry * get(const std::string & datanode, bool & isNew);
++
++    mutable std::mutex mut;
++    std::map<std::string, TransferInfoEntry> entries;
++};
++
++}
++}
++
++#endif /* _HDFS_LIBHDFS3_CLIENT_TRANSFERINFO_H_ */
+diff --git a/src/client/hdfs.h b/src/client/hdfs.h
+index e3d7441..177584c 100644
+--- a/src/client/hdfs.h
++++ b/src/client/hdfs.h
+@@ -350,6 +350,31 @@ void hdfsFreeBlockLocations(hdfsBlockLocations locations);
+  */
+ hdfsFile hdfsOpenFileWithBlockLocations(hdfsFS fs, const char * path, hdfsBlockLocations locations);
+ 
++/**
++ * Data-transfer protection negotiated with one DataNode (patch): what the process's remote block readers set up on
++ * their new connections to it (dfs.data.transfer.protection / dfs.encrypt.data.transfer.cipher.suites).
++ */
++typedef struct {
++    char * datanode;     /* "host(ip):xferPort" */
++    char * qop;          /* last negotiated: "auth", "auth-int", "auth-conf"; "none" = plain connection without SASL */
++    char * cipher;       /* "AES/CTR/NoPadding", the DIGEST-MD5 cipher ("3des", "rc4", ...) or "" (not encrypted) */
++    int keyBits;         /* AES key length, else 0 */
++    int64_t connections; /* new connections (pooled re-uses not counted) */
++    int64_t failures;    /* failed SASL handshakes */
++    int64_t firstMs;     /* unix ms of the first record */
++    int64_t lastMs;      /* unix ms of the last successful connection, 0 if none */
++    char * lastError;    /* last handshake error or "" */
++} hdfsDataTransferInfo;
++
++/**
++ * hdfsGetDataTransferInfo - process-wide snapshot, one entry per DataNode (all filesystems of the process).
++ * @param numEntries out: number of entries.
++ * @return the array (free with hdfsFreeDataTransferInfo), NULL with *numEntries = 0 if there is none or on error.
++ */
++hdfsDataTransferInfo * hdfsGetDataTransferInfo(int * numEntries);
++
++void hdfsFreeDataTransferInfo(hdfsDataTransferInfo * info, int numEntries);
++
+ /**
+  * hdfsCloseFile - Close an open file.
+  * @param fs The configured filesystem handle.
+diff --git a/src/common/Logger.cpp b/src/common/Logger.cpp
+index 5265739..1323aec 100644
+--- a/src/common/Logger.cpp
++++ b/src/common/Logger.cpp
+@@ -81,16 +81,31 @@ void Logger::setLogSeverity(LogSeverity l) {
+ 
+ void Logger::printf(LogSeverity s, const char * fmt, ...) {
+     va_list ap;
++    va_start(ap, fmt);
++    vlog(s, false, fmt, ap);
++    va_end(ap);
++}
++
++void Logger::printfAlways(LogSeverity s, const char * fmt, ...) {
++    va_list ap;
++    va_start(ap, fmt);
++    vlog(s, true, fmt, ap);
++    va_end(ap);
++}
+ 
++void Logger::vlog(LogSeverity s, bool always, const char * fmt, va_list ap) {
+     if (s > severity || fd < 0) {
+         return;
+     }
+ 
+     const char * enable_logging_env = std::getenv("HDFS_ENABLE_LOGGING");
+-    bool enable_logging = false;
+-    if (enable_logging_env) {
++    bool enable_logging = always;
++    if (enable_logging_env && !always) {
+         enable_logging = std::string(enable_logging_env) == "true";
+     }
++    if (!enable_logging) {
++        return;
++    }
+ 
+     try {
+         call_once(Once, InitProcessId);
+@@ -101,21 +116,18 @@ void Logger::printf(LogSeverity s, const char * fmt, ...) {
+         gettimeofday(&tval, NULL);
+         localtime_r(&tval.tv_sec, &tm_time);
+         //determine buffer size
+-        va_start(ap, fmt);
+-        int size = vsnprintf(nullptr, 0, fmt, ap);
+-        va_end(ap);
++        va_list aq;
++        va_copy(aq, ap);
++        int size = vsnprintf(nullptr, 0, fmt, aq);
++        va_end(aq);
+         //100 is enough for prefix
+         buffer.resize(size + 100);
+         size = snprintf(buffer.data(), buffer.size(), "%04d-%02d-%02d %02d:%02d:%02d.%06ld, %s, %s ", tm_time.tm_year + 1900,
+                         1 + tm_time.tm_mon, tm_time.tm_mday, tm_time.tm_hour,
+                         tm_time.tm_min, tm_time.tm_sec, static_cast<long>(tval.tv_usec), ProcessId, SeverityName[s]);
+-        va_start(ap, fmt);
+         size += vsnprintf(buffer.data() + size, buffer.size() - size, fmt, ap);
+-        va_end(ap);
+-        if (enable_logging) {
+-            lock_guard<mutex> lock(LoggerMutex);
+-            dprintf(fd, "%s\n", buffer.data());
+-        }
++        lock_guard<mutex> lock(LoggerMutex);
++        dprintf(fd, "%s\n", buffer.data());
+         return;
+     } catch (const std::exception & e) {
+         dprintf(fd, "%s:%d %s %s", __FILE__, __LINE__,
+diff --git a/src/common/Logger.h b/src/common/Logger.h
+index 25c122e..81437fc 100644
+--- a/src/common/Logger.h
++++ b/src/common/Logger.h
+@@ -29,6 +29,7 @@
+ #define _HDFS_LIBHDFS3_COMMON_LOGGER_H_
+ 
+ #include <atomic>
++#include <cstdarg>
+ 
+ #define DEFAULT_LOG_LEVEL INFO
+ 
+@@ -55,7 +56,12 @@ public:
+ 
+     void printf(LogSeverity s, const char * fmt, ...) __attribute__((format(printf, 3, 4)));
+ 
++    /** as printf, but written also without HDFS_ENABLE_LOGGING=true (still subject to the severity); for rare lines */
++    void printfAlways(LogSeverity s, const char * fmt, ...) __attribute__((format(printf, 3, 4)));
++
+ private:
++    void vlog(LogSeverity s, bool always, const char * fmt, va_list ap);
++
+     int fd;
+     std::atomic<LogSeverity> severity;
+ };
+@@ -68,4 +74,7 @@ extern Logger RootLogger;
+ #define LOG(s, fmt, ...) \
+     Hdfs::Internal::RootLogger.printf(s, fmt, ##__VA_ARGS__)
+ 
++#define LOG_ALWAYS(s, fmt, ...) \
++    Hdfs::Internal::RootLogger.printfAlways(s, fmt, ##__VA_ARGS__)
++
+ #endif /* _HDFS_LIBHDFS3_COMMON_LOGGER_H_ */
+-- 
+2.43.0
+

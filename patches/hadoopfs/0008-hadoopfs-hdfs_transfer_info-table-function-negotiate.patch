@@ -1,0 +1,120 @@
+From 88d5a2431b076fd8a03fce96eebadaf1629d1007 Mon Sep 17 00:00:00 2001
+From: C0fuge <189659128+C0fuge@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 15:50:47 +0000
+Subject: [PATCH] hadoopfs: hdfs_transfer_info() table function (negotiated QOP
+ / cipher)
+
+SELECT * FROM hdfs_transfer_info(): one row per DataNode this process
+connected to (libhdfs3 patch 0006, hdfsGetDataTransferInfo): datanode
+(host(ip):xferPort), qop (auth / auth-int / auth-conf, "none" = plain
+connection without SASL), cipher (AES/CTR/NoPadding, 3des, ... or NULL),
+key_bits (AES), encrypted (qop = auth-conf), connections (new ones,
+pooled re-uses not counted), failures (failed SASL handshakes),
+first_seen, last_connected (UTC), last_error.
+---
+ src/hadoopfs_extension.cpp | 76 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/src/hadoopfs_extension.cpp b/src/hadoopfs_extension.cpp
+index a326691..37ce46c 100644
+--- a/src/hadoopfs_extension.cpp
++++ b/src/hadoopfs_extension.cpp
+@@ -3,14 +3,88 @@
+ #include "duckdb.hpp"
+ #include "hadoopfs_extension.hpp"
+ #include "duckdb/common/printer.hpp"
++#include "duckdb/common/types/timestamp.hpp"
++#include "duckdb/function/table_function.hpp"
+ 
+ namespace duckdb
+ {
++    // hdfs_transfer_info(): the data-transfer protection libhdfs3 negotiated with each DataNode in this process
++    // (libhdfs3 patch 0006, hdfsGetDataTransferInfo). Timestamps are UTC.
++    struct HdfsTransferInfoRow {
++        string datanode, qop, cipher, last_error;
++        int32_t key_bits;
++        int64_t connections, failures, first_ms, last_ms;
++    };
++
++    struct HdfsTransferInfoState : public GlobalTableFunctionState {
++        vector<HdfsTransferInfoRow> rows;
++        idx_t offset = 0;
++    };
++
++    static unique_ptr<FunctionData> HdfsTransferInfoBind(ClientContext &context, TableFunctionBindInput &input,
++                                                         vector<LogicalType> &return_types, vector<string> &names)
++    {
++        names = {"datanode", "qop", "cipher", "key_bits", "encrypted", "connections", "failures",
++                 "first_seen", "last_connected", "last_error"};
++        return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER,
++                        LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::TIMESTAMP,
++                        LogicalType::TIMESTAMP, LogicalType::VARCHAR};
++        return nullptr;
++    }
++
++    static unique_ptr<GlobalTableFunctionState> HdfsTransferInfoInit(ClientContext &context,
++                                                                     TableFunctionInitInput &input)
++    {
++        auto state = make_uniq<HdfsTransferInfoState>();
++        int n = 0;
++        hdfsDataTransferInfo *info = hdfsGetDataTransferInfo(&n);
++        for (int i = 0; i < n; i++) {
++            HdfsTransferInfoRow r;
++            r.datanode = info[i].datanode ? info[i].datanode : "";
++            r.qop = info[i].qop ? info[i].qop : "";
++            r.cipher = info[i].cipher ? info[i].cipher : "";
++            r.last_error = info[i].lastError ? info[i].lastError : "";
++            r.key_bits = info[i].keyBits;
++            r.connections = info[i].connections;
++            r.failures = info[i].failures;
++            r.first_ms = info[i].firstMs;
++            r.last_ms = info[i].lastMs;
++            state->rows.push_back(std::move(r));
++        }
++        hdfsFreeDataTransferInfo(info, n);
++        return std::move(state);
++    }
++
++    static void HdfsTransferInfoFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output)
++    {
++        auto &state = data_p.global_state->Cast<HdfsTransferInfoState>();
++        idx_t count = 0;
++        while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
++            auto &r = state.rows[state.offset++];
++            output.SetValue(0, count, Value(r.datanode));
++            output.SetValue(1, count, r.qop.empty() ? Value() : Value(r.qop));
++            output.SetValue(2, count, r.cipher.empty() ? Value() : Value(r.cipher));
++            output.SetValue(3, count, r.key_bits > 0 ? Value::INTEGER(r.key_bits) : Value());
++            output.SetValue(4, count, r.qop.empty() ? Value() : Value::BOOLEAN(r.qop == "auth-conf"));
++            output.SetValue(5, count, Value::BIGINT(r.connections));
++            output.SetValue(6, count, Value::BIGINT(r.failures));
++            output.SetValue(7, count, Value::TIMESTAMP(Timestamp::FromEpochMs(r.first_ms)));
++            output.SetValue(8, count, r.last_ms > 0 ? Value::TIMESTAMP(Timestamp::FromEpochMs(r.last_ms)) : Value());
++            output.SetValue(9, count, r.last_error.empty() ? Value() : Value(r.last_error));
++            count++;
++        }
++        output.SetCardinality(count);
++    }
++
+     static void LoadInternal(ExtensionLoader &loader)
+     {
+         DatabaseInstance &instance = loader.GetDatabaseInstance();
+         auto &fs = instance.GetFileSystem();
+         fs.RegisterSubSystem(duckdb::make_uniq<HadoopFileSystem>(instance));
++
++        TableFunction transfer_info("hdfs_transfer_info", {}, HdfsTransferInfoFunction, HdfsTransferInfoBind,
++                                    HdfsTransferInfoInit);
++        loader.RegisterFunction(transfer_info);
+     }
+ 
+     void HadoopfsExtension::Load(ExtensionLoader &loader)
+@@ -29,4 +103,4 @@ extern "C" {
+     DUCKDB_CPP_EXTENSION_ENTRY(hadoopfs, loader) {
+         duckdb::LoadInternal(loader);
+     }
+-}
+\ No newline at end of file
++}
+-- 
+2.43.0
+

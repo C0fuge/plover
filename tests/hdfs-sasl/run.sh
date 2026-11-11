@@ -100,6 +100,39 @@ for c in $CONFS; do
   done
   echo "$(basename $c .xml): point reads OK"
 done
+# hdfs_transfer_info() (hadoopfs 0008 / libhdfs3 0006) and the INFO log line without HDFS_ENABLE_LOGGING: one line per
+# DataNode (first negotiation), the table shows what every DataNode negotiated
+# check_info <conf> <qop> <cipher or NULL> <key bits: NULL or ">0">
+check_info() {
+  local out err rows lines
+  out=$(env -u HDFS_ENABLE_LOGGING LIBHDFS3_CONF=$1 $D -unsigned -csv -noheader -c "LOAD '$EXT';
+    SELECT count(*) FROM read_parquet('hdfs://localhost:8020/t/big.parquet');
+    SELECT datanode, qop, coalesce(cipher, 'NULL'), coalesce(key_bits::VARCHAR, 'NULL'), encrypted, connections, failures,
+      last_connected IS NOT NULL AND first_seen <= last_connected FROM hdfs_transfer_info() ORDER BY datanode;" 2>/tmp/info.err)
+  echo "$(basename "$1" .xml) hdfs_transfer_info():"; echo "$out" | tail -n +2 | sed 's/^/  /'
+  rows=$(echo "$out" | tail -n +2)
+  [ -n "$rows" ] || { cat /tmp/info.err | tail -20; echo "FAIL: hdfs_transfer_info() empty ($1)"; exit 1; }
+  local enc=false; [ "$2" = auth-conf ] && enc=true
+  if echo "$rows" | awk -F, -v q="$2" -v c="$3" -v k="$4" -v e="$enc" '
+       { kb = (k == ">0") ? ($4 != "NULL" && $4 > 0) : ($4 == k)
+         if ($2 != q || $3 != c || !kb || $5 != e || $6 < 1 || $7 != 0 || $8 != "true") bad = 1 }
+       END { exit bad ? 0 : 1 }'; then
+    echo "FAIL: $(basename "$1" .xml): want qop $2, cipher $3, key_bits $4 on every DataNode"; exit 1
+  fi
+  lines=$(grep -c "DataTransferSasl: DataNode .*: qop $2, cipher" /tmp/info.err || true)
+  [ "$lines" -eq "$(echo "$rows" | wc -l)" ] || { cat /tmp/info.err | head; echo "FAIL: want one INFO line per DataNode without HDFS_ENABLE_LOGGING, got $lines"; exit 1; }
+  grep -m1 "DataTransferSasl" /tmp/info.err | sed 's/^/  log: /'
+}
+check_info /tmp/privacy.xml auth-conf 3des NULL
+[ -n "$CIPHER" ] && check_info /tmp/aes.xml auth-conf AES/CTR/NoPadding '>0'
+[ -f /tmp/authpriv.xml ] && check_info /tmp/authpriv.xml auth NULL NULL
+[ -f /tmp/privauth.xml ] && check_info /tmp/privauth.xml auth-conf 3des NULL
+# dfs.client.log.severity=WARNING silences the line
+sed 's|</configuration>|<property><name>dfs.client.log.severity</name><value>WARNING</value></property></configuration>|' /tmp/privacy.xml > /tmp/quiet.xml
+env -u HDFS_ENABLE_LOGGING LIBHDFS3_CONF=/tmp/quiet.xml $D -unsigned -csv -noheader -c "LOAD '$EXT';
+  SELECT count(*) FROM read_parquet('hdfs://localhost:8020/t/big.parquet');" >/dev/null 2>/tmp/quiet.err
+! grep -q "DataTransferSasl" /tmp/quiet.err || { echo "FAIL: INFO line with severity WARNING"; exit 1; }
+echo "severity WARNING: no negotiation line"
 # without the client setting the DataNode must refuse the plain read (proves SASL was in effect)
 if LIBHDFS3_CONF=/tmp/plain.xml timeout 120 $D -unsigned -csv -noheader -c "LOAD '$EXT'; SET hdfs_read_timeout_ms = 5000; $Q;" > /tmp/plain.out 2>&1; then
   cat /tmp/plain.out; echo "FAIL: plain read succeeded against a privacy DataNode"; exit 1
