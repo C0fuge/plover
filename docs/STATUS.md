@@ -5,6 +5,11 @@ read-error / timeout fixes. Sources are fetched by pinned commit (see `sources.e
 
 ## Next steps
 
+> **Maintainer, 2026-11-11 18:40:** stand finding on afc8: the negotiated data-transfer QOP and cipher are logged
+> nowhere (0 `DataTransferSasl` lines even with `dfs.client.log.severity=DEBUG1`); AES vs 3des is only provable by
+> timing. Log the negotiated QOP + cipher once per DataNode connection at INFO, and expose it to DuckDB (e.g. a table
+> function `hdfs_transfer_info()` or a setting the server can read). Release as afc9.
+
 > **Maintainer, 2026-11-10 11:25 - check first (DONE, session (4) below):** the real cluster's DataNodes use `dfs.data.transfer.protection =
 > authentication,privacy` (several QOPs, client and DataNode negotiate). Add that value to the SASL HDFS test (DataNode
 > side `authentication,privacy`, client side the same and also `privacy` only / `authentication` only) and fix the
