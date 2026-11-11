@@ -11,5 +11,6 @@ log "deadnodes_test"
 $CXX -std=c++20 -O1 -g -Wall -pthread -I src/src/client "$HERE/tests/libhdfs3/deadnodes_test.cpp" src/src/client/DeadNodes.cpp -o deadnodes_test
 ./deadnodes_test
 log "transferinfo_test"
-$CXX -std=c++20 -O1 -g -Wall -pthread -fsanitize=thread -I src/src/client "$HERE/tests/libhdfs3/transferinfo_test.cpp" src/src/client/TransferInfo.cpp -o transferinfo_test
+ti() { $CXX -std=c++20 -O1 -g -Wall -pthread "$@" -I src/src/client "$HERE/tests/libhdfs3/transferinfo_test.cpp" src/src/client/TransferInfo.cpp -o transferinfo_test; }
+ti -fsanitize=thread 2>/dev/null || { log "no libtsan, plain build"; ti; }
 ./transferinfo_test
